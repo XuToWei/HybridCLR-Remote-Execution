@@ -1,4 +1,6 @@
 # HybridCLR Remote Execution
+[简体中文](README.zh-CN.md)
+
 
 This package provides a development-only TCP bridge between a Unity Editor and a packaged HybridCLR Player.
 
