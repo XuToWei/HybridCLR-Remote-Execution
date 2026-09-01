@@ -25,7 +25,8 @@ namespace HybridCLR.RemoteExecution
         AssemblyEnd = 13,
         ApplyResult = 14,
         Ping = 15,
-        Pong = 16
+        Pong = 16,
+        LoadComplete = 17
     }
 
     public sealed class RemoteFrame
@@ -348,6 +349,17 @@ namespace HybridCLR.RemoteExecution
                 pdb = reader.ReadBoolean();
                 EnsureEnd(stream);
             }
+        }
+
+        public static byte[] EncodeBundleComplete(Guid bundleId)
+        {
+            return bundleId.ToByteArray();
+        }
+
+        public static Guid DecodeBundleComplete(byte[] payload)
+        {
+            if (payload == null || payload.Length != 16) throw new InvalidDataException("Invalid bundle completion message.");
+            return new Guid(payload);
         }
 
         public static byte[] EncodeMethods(IReadOnlyList<RemoteMethodInfo> methods)

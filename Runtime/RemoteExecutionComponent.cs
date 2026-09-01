@@ -209,8 +209,12 @@ namespace HybridCLR.RemoteExecution
             }
             catch (Exception exception)
             {
+                Guid responseRequestId = frame.Kind == RemoteMessageKind.Invoke
+                    ? frame.RequestId : m_IncomingBundle?.RequestId ?? frame.RequestId;
                 m_IncomingBundle = null;
-                Send(RemoteMessageKind.ApplyResult, frame.RequestId,
+                RemoteMessageKind resultKind = frame.Kind == RemoteMessageKind.Invoke
+                    ? RemoteMessageKind.InvokeResult : RemoteMessageKind.ApplyResult;
+                Send(resultKind, responseRequestId,
                     RemoteExecutionProtocol.EncodeResult(false, "PROTOCOL_ERROR", exception.Message));
             }
         }
@@ -262,7 +266,7 @@ namespace HybridCLR.RemoteExecution
             long total = 0;
             foreach (RemoteAssemblyInfo assembly in manifest.Assemblies) total = checked(total + assembly.DllLength + assembly.PdbLength);
             if (total > m_Configuration.MaxBundleBytes) throw new InvalidDataException("Bundle exceeds the configured size limit.");
-            m_IncomingBundle = new IncomingBundle(manifest);
+            m_IncomingBundle = new IncomingBundle(manifest, frame.RequestId);
         }
 
         private void BeginAssembly(RemoteFrame frame)
@@ -342,21 +346,28 @@ namespace HybridCLR.RemoteExecution
                 }
                 RefreshMethods(loaded);
                 m_IncomingBundle = null;
-                Send(RemoteMessageKind.ApplyResult, bundle.Manifest.BundleId,
+                Send(RemoteMessageKind.ApplyResult, bundle.RequestId,
                     RemoteExecutionProtocol.EncodeResult(true, "", bundle.Manifest.Generation));
             }
             catch (Exception exception)
             {
                 m_IncomingBundle = null;
-                Send(RemoteMessageKind.ApplyResult, bundle.Manifest.BundleId,
+                Send(RemoteMessageKind.ApplyResult, bundle.RequestId,
                     RemoteExecutionProtocol.EncodeResult(false, "LOAD_FAILED", exception.Message));
             }
         }
 
         private void RefreshMethods(IEnumerable<Assembly> additionalAssemblies)
         {
-            var assemblies = new List<Assembly>(AppDomain.CurrentDomain.GetAssemblies());
-            if (additionalAssemblies != null) assemblies.AddRange(additionalAssemblies);
+            var assemblies = new List<Assembly>();
+            var seen = new HashSet<Assembly>();
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+                if (assembly != null && seen.Add(assembly)) assemblies.Add(assembly);
+            if (additionalAssemblies != null)
+            {
+                foreach (Assembly assembly in additionalAssemblies)
+                    if (assembly != null && seen.Add(assembly)) assemblies.Add(assembly);
+            }
             IReadOnlyList<RemoteCallableDescriptor> descriptors = RemoteCallableRegistry.Discover(assemblies);
             m_Methods.Clear();
             foreach (RemoteCallableDescriptor descriptor in descriptors) m_Methods.Add(descriptor.Id, descriptor);
@@ -401,13 +412,15 @@ namespace HybridCLR.RemoteExecution
 
         private sealed class IncomingBundle
         {
-            internal IncomingBundle(RemoteBundleManifest manifest)
+            internal IncomingBundle(RemoteBundleManifest manifest, Guid requestId)
             {
                 Manifest = manifest;
+                RequestId = requestId;
                 Assemblies = new IncomingAssembly[manifest.Assemblies.Length];
                 for (int i = 0; i < Assemblies.Length; i++) Assemblies[i] = new IncomingAssembly();
             }
             internal RemoteBundleManifest Manifest { get; }
+            internal Guid RequestId { get; }
             internal IncomingAssembly[] Assemblies { get; }
             internal bool IsComplete()
             {

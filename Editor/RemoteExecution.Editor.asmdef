@@ -8,7 +8,6 @@
   "overrideReferences": false,
   "precompiledReferences": [],
   "autoReferenced": true,
-  "defineConstraints": ["UNITY_HOTFIX"],
   "versionDefines": [],
   "noEngineReferences": false
 }

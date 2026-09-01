@@ -10,9 +10,11 @@ This package provides a development-only TCP bridge between a Unity Editor and a
 2. Generate HybridCLR AOT metadata for the target platform.
 3. Create a `RemoteExecutionSettings` asset and assign it to a `RemoteExecutionComponent` in the boot scene.
 4. Enable the component only in a Development Player. Configure the Editor host, port, and the session token shown by the Editor window.
-5. In the Editor, open **Game > HybridCLR > Remote Execution**, start the server, and connect the Player.
+5. In the Editor, open **Window > HybridCLR > Remote Execution**, start the server, and connect the Player.
 
 Assemblies are sent with a manifest, lengths, SHA-256 hashes, and bounded chunks. The Player validates the complete transfer before calling `Assembly.Load` and exposing methods marked with `RemoteCallableAttribute`.
+
+The **Window > HybridCLR > Remote Execution** window can select configured hot-update assemblies, choose their compiler defines, enter a complete C# type, and run its explicitly marked static parameterless entry method after the bundle is loaded. The custom type is compiled into the fixed `RemoteExecution.Dynamic` assembly; configure that assembly as a HybridCLR hot-update assembly before building an IL2CPP Player.
 
 ## Callable methods
 

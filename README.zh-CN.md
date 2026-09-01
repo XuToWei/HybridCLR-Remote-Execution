@@ -47,7 +47,7 @@
 
 在 Unity 菜单中打开：
 
-**Game > HybridCLR > Remote Execution**
+**Window > HybridCLR > Remote Execution**
 
 在窗口中：
 
@@ -57,9 +57,17 @@
 4. 确认 **Session Token** 与 Player 配置中的令牌一致。
 5. 点击 **Start**。
 6. 启动已配置好的 Development Player，等待它出现在 **Connected Players** 列表中。
-7. 对已认证的连接点击 **Compile & Send**。
+7. 对已认证的连接点击 **Compile, Load & Execute**。
 
 服务器会根据 Player 在握手中报告的目标平台进行编译，不要在同一个连接上发送其他平台的程序集。
+
+### 手动代码与程序集选择
+
+窗口中的 **Custom C# Code** 接受完整 C# 类型。入口类型的 `FullName` 和方法名需要单独填写；入口必须带 `[RemoteCallable]`，是 `static`、无参数，并返回 `void`、`Task` 或 `UniTask`。代码会编译为固定名称 `RemoteExecution.Dynamic` 的独立程序集，然后在 Player 完成加载后自动调用。
+
+在 **Assemblies to Compile & Send** 中可以多选 HybridCLR 热更新程序集。工具会根据 Player 脚本程序集引用补齐已配置的热更新依赖，并按依赖顺序发送。**Assembly Defines** 显示当前所选程序集的编译宏，需要手动勾选。
+
+使用独立动态程序集前，请先将 `RemoteExecution.Dynamic` 配置为 HybridCLR 热更新程序集并在构建 Player 时完成对应的 AOT/HybridCLR 配置，否则 IL2CPP Player 可能无法加载该程序集。动态程序集同名替换不受 Unity 进程内卸载支持，修改代码后通常需要重启 Player。
 
 ## 配置项
 
@@ -136,7 +144,7 @@ public static class DevelopmentCommands
 7. Player 校验清单、长度、分片顺序和 SHA-256 哈希。
 8. 收到 `LoadComplete` 后，Player 调用 `Assembly.Load`，刷新可调用方法，并返回应用结果。
 
-协议还定义了 `ListMethods` 和 `Invoke`，用于查询和调用已登记方法。当前内置 Editor 窗口主要提供服务器管理以及 **Compile & Send** 操作；如果要在 Editor 中显示方法列表或发起调用，需要使用协议客户端或自行扩展 Editor 窗口。
+协议还定义了 `ListMethods` 和 `Invoke`，用于查询和调用已登记方法。当前内置 Editor 窗口提供程序集编译发送、加载和自定义代码执行。
 
 ## 安全注意事项
 
@@ -163,7 +171,6 @@ public static class DevelopmentCommands
 ### 启动服务器失败
 
 - 确认 HybridCLR 已启用。
-- 确认项目正确编译了 `UNITY_HOTFIX` 条件下的程序集；否则服务器会提示远程执行需要 `UNITY_HOTFIX`。
 - 检查 Bind Address 是否为有效 IP 地址，端口是否在 `0..65535` 范围内且未被占用。
 - 确认令牌不为空。
 
