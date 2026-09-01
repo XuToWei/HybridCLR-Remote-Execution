@@ -1,0 +1,12 @@
+{
+  "name": "com.xw.hybridclr.remote-execution",
+  "version": "0.1.0",
+  "displayName": "HybridCLR Remote Execution",
+  "description": "Development-only TCP bridge for compiling and executing HybridCLR assemblies on connected Players.",
+  "unity": "2021.3",
+  "dependencies": {
+    "com.code-philosophy.hybridclr": "8.13.0"
+  },
+  "keywords": ["HybridCLR", "hotupdate", "development", "remote-execution"],
+  "author": { "name": "Xu Wei" }
+}

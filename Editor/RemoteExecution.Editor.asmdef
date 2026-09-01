@@ -1,0 +1,14 @@
+{
+  "name": "HybridCLR.RemoteExecution.Editor",
+  "rootNamespace": "HybridCLR.RemoteExecution",
+  "references": ["HybridCLR.RemoteExecution.Runtime", "HybridCLR.Editor"],
+  "includePlatforms": ["Editor"],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": ["UNITY_HOTFIX"],
+  "versionDefines": [],
+  "noEngineReferences": false
+}
