@@ -1,11 +1,11 @@
 using System;
 
-namespace HybridCLR.RemoteExecution
+namespace RemoteExecution
 {
     [AttributeUsage(AttributeTargets.Method, AllowMultiple = false, Inherited = false)]
-    public sealed class RemoteCallableAttribute : Attribute
+    public sealed class RemoteCommandAttribute : Attribute
     {
-        public RemoteCallableAttribute(string description, int timeoutSeconds = 30)
+        public RemoteCommandAttribute(string description, int timeoutSeconds = 30)
         {
             Description = description;
             TimeoutSeconds = timeoutSeconds;

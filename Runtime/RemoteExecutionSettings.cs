@@ -1,27 +1,23 @@
 using UnityEngine;
 
-namespace HybridCLR.RemoteExecution
+namespace RemoteExecution
 {
-    [CreateAssetMenu(menuName = "HybridCLR/Remote Execution Settings", fileName = "RemoteExecutionSettings")]
+    [CreateAssetMenu(menuName = "Unity/Remote Execution Settings", fileName = "RemoteExecutionSettings")]
     public sealed class RemoteExecutionSettings : ScriptableObject
     {
-        [Header("Development only")]
+        [Header("Connection")]
         [SerializeField] private bool m_Enabled = true;
         [SerializeField] private string m_EditorHost = "127.0.0.1";
         [SerializeField] private int m_EditorPort = 38421;
-        [SerializeField] private string m_AuthenticationToken = "";
         [SerializeField] private string m_ClientId = "";
-        [SerializeField] private int m_MaxBundleBytes = RemoteExecutionProtocol.DefaultMaxBundleBytes;
-        [SerializeField] private bool m_LoadAotMetadata = true;
-        [SerializeField] private TextAsset[] m_AotMetadataAssemblies = new TextAsset[0];
+        [SerializeField] private int m_MaxCommandRequestBytes = RemoteExecutionProtocol.MaxCommandRequestBytes;
+        [SerializeField] private int m_MaxCommandResponseBytes = RemoteExecutionProtocol.DefaultMaxCommandResponseBytes;
 
         public bool Enabled => m_Enabled;
         public string EditorHost => m_EditorHost;
         public int EditorPort => m_EditorPort;
-        public string AuthenticationToken => m_AuthenticationToken;
         public string ClientId => m_ClientId;
-        public int MaxBundleBytes => Mathf.Clamp(m_MaxBundleBytes, 1, RemoteExecutionProtocol.DefaultMaxBundleBytes);
-        public bool LoadAotMetadata => m_LoadAotMetadata;
-        public TextAsset[] AotMetadataAssemblies => m_AotMetadataAssemblies;
+        public int MaxCommandRequestBytes => Mathf.Clamp(m_MaxCommandRequestBytes, 0, RemoteExecutionProtocol.MaxCommandRequestBytes);
+        public int MaxCommandResponseBytes => Mathf.Clamp(m_MaxCommandResponseBytes, 0, RemoteExecutionProtocol.MaxCommandResponseBytes);
     }
 }

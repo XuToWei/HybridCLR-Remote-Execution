@@ -6,27 +6,24 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace HybridCLR.RemoteExecution
+namespace RemoteExecution
 {
     public enum RemoteMessageKind : byte
     {
         Hello = 1,
-        Challenge = 2,
-        Authenticate = 3,
-        Ready = 4,
-        Error = 5,
-        ListMethods = 6,
-        Methods = 7,
-        Invoke = 8,
-        InvokeResult = 9,
-        LoadManifest = 10,
-        AssemblyBegin = 11,
-        AssemblyChunk = 12,
-        AssemblyEnd = 13,
-        ApplyResult = 14,
-        Ping = 15,
-        Pong = 16,
-        LoadComplete = 17
+        Ready = 2,
+        Error = 3,
+        Ping = 4,
+        Pong = 5,
+        ListCommands = 6,
+        Commands = 7,
+        CommandInputBegin = 8,
+        CommandInputChunk = 9,
+        CommandInputEnd = 10,
+        CommandResult = 11,
+        CommandResultChunk = 12,
+        CommandResultEnd = 13,
+        CancelCommand = 14
     }
 
     public sealed class RemoteFrame
@@ -48,31 +45,22 @@ namespace HybridCLR.RemoteExecution
         public string ClientId;
         public string Target;
         public string UnityVersion;
-        public string HybridCLRVersion;
+        public string RuntimeVersion;
     }
 
-    public sealed class RemoteAssemblyInfo
-    {
-        public string Name;
-        public long DllLength;
-        public long PdbLength;
-        public byte[] DllSha256;
-        public byte[] PdbSha256;
-    }
-
-    public sealed class RemoteBundleManifest
-    {
-        public Guid BundleId;
-        public string Generation;
-        public string Target;
-        public RemoteAssemblyInfo[] Assemblies = Array.Empty<RemoteAssemblyInfo>();
-    }
-
-    public sealed class RemoteMethodInfo
+    public sealed class RemoteCommandInfo
     {
         public string Id;
+        public string Name;
         public string Description;
+        public string Category;
         public int TimeoutSeconds;
+        public int MaxRequestBytes;
+        public int MaxResponseBytes;
+        public string RequestContentType;
+        public string ResponseContentType;
+        public bool Executable;
+        public bool RequiresMainThread;
     }
 
     public sealed class RemoteError
@@ -83,38 +71,45 @@ namespace HybridCLR.RemoteExecution
 
     public static class RemoteExecutionProtocol
     {
-        public const ushort Version = 1;
+        public const ushort Version = 3;
         public const int HeaderLength = 28;
         public const int MaxFramePayload = 1024 * 1024;
-        public const int DefaultMaxBundleBytes = 128 * 1024 * 1024;
         public const int MaxChunkBytes = 60 * 1024;
         public const int MaxStringBytes = 32 * 1024;
-        private const uint Magic = 0x31524847; // GHR1 in little-endian form.
+        public const int MaxCommandRequestBytes = 128 * 1024 * 1024;
+        public const int MaxCommandResponseBytes = 64 * 1024 * 1024;
+        public const int DefaultMaxCommandRequestBytes = 16 * 1024 * 1024;
+        public const int DefaultMaxCommandResponseBytes = 16 * 1024 * 1024;
+        private const uint Magic = 0x33585255; // URX3 in little-endian form.
+        private static readonly UTF8Encoding s_Utf8 = new UTF8Encoding(false, true);
 
         public static async Task<RemoteFrame> ReadFrameAsync(Stream stream, CancellationToken cancellationToken)
         {
+            if (stream == null) throw new ArgumentNullException(nameof(stream));
             byte[] header = new byte[HeaderLength];
             await ReadExactlyAsync(stream, header, 0, header.Length, cancellationToken).ConfigureAwait(false);
-            if (ReadUInt32(header, 0) != Magic)
-                throw new InvalidDataException("Invalid remote execution frame magic.");
-            if (ReadUInt16(header, 4) != Version)
-                throw new InvalidDataException("Unsupported remote execution protocol version.");
-            if (header[7] != 0)
-                throw new InvalidDataException("Unsupported remote execution frame flags.");
-
+            if (ReadUInt32(header, 0) != Magic) throw new InvalidDataException("Invalid remote execution frame magic.");
+            if (ReadUInt16(header, 4) != Version) throw new InvalidDataException("Unsupported remote execution protocol version.");
+            if (header[7] != 0) throw new InvalidDataException("Unsupported remote execution frame flags.");
             int payloadLength = checked((int)ReadUInt32(header, 24));
             if (payloadLength < 0 || payloadLength > MaxFramePayload)
                 throw new InvalidDataException($"Frame payload exceeds {MaxFramePayload} bytes.");
             byte[] requestId = new byte[16];
             Buffer.BlockCopy(header, 8, requestId, 0, requestId.Length);
+            RemoteMessageKind kind = (RemoteMessageKind)header[6];
+            if (!Enum.IsDefined(typeof(RemoteMessageKind), kind))
+                throw new InvalidDataException("Unknown remote execution message kind.");
             byte[] payload = new byte[payloadLength];
             await ReadExactlyAsync(stream, payload, 0, payload.Length, cancellationToken).ConfigureAwait(false);
-            return new RemoteFrame((RemoteMessageKind)header[6], new Guid(requestId), payload);
+            return new RemoteFrame(kind, new Guid(requestId), payload);
         }
 
         public static async Task WriteFrameAsync(Stream stream, RemoteFrame frame, CancellationToken cancellationToken)
         {
+            if (stream == null) throw new ArgumentNullException(nameof(stream));
             if (frame == null) throw new ArgumentNullException(nameof(frame));
+            if (!Enum.IsDefined(typeof(RemoteMessageKind), frame.Kind))
+                throw new InvalidDataException("Unknown remote execution message kind.");
             if (frame.Payload.Length > MaxFramePayload)
                 throw new InvalidDataException($"Frame payload exceeds {MaxFramePayload} bytes.");
             byte[] header = new byte[HeaderLength];
@@ -138,7 +133,7 @@ namespace HybridCLR.RemoteExecution
                 WriteString(writer, hello.ClientId);
                 WriteString(writer, hello.Target);
                 WriteString(writer, hello.UnityVersion);
-                WriteString(writer, hello.HybridCLRVersion);
+                WriteString(writer, hello.RuntimeVersion);
                 return stream.ToArray();
             }
         }
@@ -153,33 +148,14 @@ namespace HybridCLR.RemoteExecution
                     ClientId = ReadString(reader),
                     Target = ReadString(reader),
                     UnityVersion = ReadString(reader),
-                    HybridCLRVersion = ReadString(reader)
+                    RuntimeVersion = ReadString(reader)
                 };
                 EnsureEnd(stream);
+                if (string.IsNullOrWhiteSpace(hello.ClientId) ||
+                    string.IsNullOrWhiteSpace(hello.Target))
+                    throw new InvalidDataException("Hello client ID and target are required.");
                 return hello;
             }
-        }
-
-        public static byte[] EncodeChallenge(byte[] nonce)
-        {
-            if (nonce == null || nonce.Length < 16 || nonce.Length > 64)
-                throw new InvalidDataException("Challenge nonce must contain 16..64 bytes.");
-            return (byte[])nonce.Clone();
-        }
-
-        public static byte[] DecodeChallenge(byte[] payload)
-        {
-            if (payload == null || payload.Length < 16 || payload.Length > 64)
-                throw new InvalidDataException("Invalid challenge nonce.");
-            return (byte[])payload.Clone();
-        }
-
-        public static byte[] ComputeAuthentication(byte[] nonce, string token)
-        {
-            if (nonce == null) throw new ArgumentNullException(nameof(nonce));
-            if (string.IsNullOrEmpty(token)) throw new InvalidDataException("Authentication token is required.");
-            using (var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(token)))
-                return hmac.ComputeHash(nonce);
         }
 
         public static bool FixedTimeEquals(byte[] left, byte[] right)
@@ -190,239 +166,198 @@ namespace HybridCLR.RemoteExecution
             return difference == 0;
         }
 
-        public static byte[] EncodeManifest(RemoteBundleManifest manifest)
+        public static byte[] EncodeCommands(IReadOnlyList<RemoteCommandInfo> commands)
         {
-            if (manifest == null || manifest.Assemblies == null || manifest.Assemblies.Length == 0 || manifest.Assemblies.Length > 256)
-                throw new InvalidDataException("A bundle must contain 1..256 assemblies.");
+            if (commands == null || commands.Count > ushort.MaxValue) throw new InvalidDataException("Too many commands.");
             using (var stream = new MemoryStream())
             using (var writer = NewWriter(stream))
             {
-                writer.Write(manifest.BundleId.ToByteArray());
-                WriteString(writer, manifest.Generation);
-                WriteString(writer, manifest.Target);
-                writer.Write((ushort)manifest.Assemblies.Length);
-                long total = 0;
-                foreach (var assembly in manifest.Assemblies)
+                writer.Write((ushort)commands.Count);
+                foreach (RemoteCommandInfo command in commands)
                 {
-                    ValidateAssemblyInfo(assembly);
-                    total = checked(total + assembly.DllLength + assembly.PdbLength);
-                    if (total > DefaultMaxBundleBytes) throw new InvalidDataException("Bundle is too large.");
-                    WriteString(writer, assembly.Name);
-                    writer.Write(assembly.DllLength);
-                    writer.Write(assembly.PdbLength);
-                    writer.Write(assembly.DllSha256);
-                    if (assembly.PdbLength > 0) writer.Write(assembly.PdbSha256);
+                    ValidateCommandInfo(command);
+                    WriteString(writer, command.Id);
+                    WriteString(writer, command.Name);
+                    WriteString(writer, command.Description);
+                    WriteString(writer, command.Category);
+                    writer.Write(command.TimeoutSeconds);
+                    writer.Write(command.MaxRequestBytes);
+                    writer.Write(command.MaxResponseBytes);
+                    WriteString(writer, command.RequestContentType);
+                    WriteString(writer, command.ResponseContentType);
+                    writer.Write(command.Executable);
+                    writer.Write(command.RequiresMainThread);
                 }
-                return stream.ToArray();
+                byte[] result = stream.ToArray();
+                if (result.Length > MaxFramePayload) throw new InvalidDataException("Command catalog is too large.");
+                return result;
             }
         }
 
-        public static RemoteBundleManifest DecodeManifest(byte[] payload)
+        public static RemoteCommandInfo[] DecodeCommands(byte[] payload)
         {
             using (var stream = NewStream(payload))
             using (var reader = NewReader(stream))
             {
-                byte[] bundleId = reader.ReadBytes(16);
-                if (bundleId.Length != 16) throw new EndOfStreamException();
-                var manifest = new RemoteBundleManifest
-                {
-                    BundleId = new Guid(bundleId),
-                    Generation = ReadString(reader),
-                    Target = ReadString(reader)
-                };
                 int count = reader.ReadUInt16();
-                if (count < 1 || count > 256) throw new InvalidDataException("Invalid assembly count.");
-                manifest.Assemblies = new RemoteAssemblyInfo[count];
-                long total = 0;
+                var commands = new RemoteCommandInfo[count];
                 for (int i = 0; i < count; i++)
                 {
-                    var assembly = new RemoteAssemblyInfo
+                    commands[i] = new RemoteCommandInfo
                     {
+                        Id = ReadString(reader),
                         Name = ReadString(reader),
-                        DllLength = reader.ReadInt64(),
-                        PdbLength = reader.ReadInt64(),
-                        DllSha256 = reader.ReadBytes(32)
+                        Description = ReadString(reader),
+                        Category = ReadString(reader),
+                        TimeoutSeconds = reader.ReadInt32(),
+                        MaxRequestBytes = reader.ReadInt32(),
+                        MaxResponseBytes = reader.ReadInt32(),
+                        RequestContentType = ReadString(reader),
+                        ResponseContentType = ReadString(reader),
+                        Executable = reader.ReadBoolean(),
+                        RequiresMainThread = reader.ReadBoolean()
                     };
-                    if (assembly.DllSha256.Length != 32) throw new InvalidDataException("Invalid DLL hash.");
-                    assembly.PdbSha256 = assembly.PdbLength > 0 ? reader.ReadBytes(32) : Array.Empty<byte>();
-                    ValidateAssemblyInfo(assembly);
-                    total = checked(total + assembly.DllLength + assembly.PdbLength);
-                    if (total > DefaultMaxBundleBytes) throw new InvalidDataException("Bundle is too large.");
-                    manifest.Assemblies[i] = assembly;
+                    ValidateCommandInfo(commands[i]);
                 }
                 EnsureEnd(stream);
-                return manifest;
+                return commands;
             }
         }
 
-        public static byte[] EncodeAssemblyBegin(Guid bundleId, int assemblyIndex, bool pdb, long length, byte[] sha256)
+        public static byte[] EncodeCommandInputBegin(string commandId, string contentType, long length, byte[] sha256)
         {
-            if (sha256 == null || sha256.Length != 32 || assemblyIndex < 0 || length < 0)
-                throw new InvalidDataException("Invalid assembly begin message.");
+            ValidateCommandInputIdentity(commandId, contentType);
+            if (length < 0 || length > MaxCommandRequestBytes || sha256 == null || sha256.Length != 32)
+                throw new InvalidDataException("Invalid command input metadata.");
             using (var stream = new MemoryStream())
             using (var writer = NewWriter(stream))
             {
-                writer.Write(bundleId.ToByteArray());
-                writer.Write(assemblyIndex);
-                writer.Write(pdb);
+                WriteString(writer, commandId);
+                WriteString(writer, contentType);
                 writer.Write(length);
                 writer.Write(sha256);
                 return stream.ToArray();
             }
         }
 
-        public static void DecodeAssemblyBegin(byte[] payload, out Guid bundleId, out int assemblyIndex, out bool pdb, out long length, out byte[] sha256)
+        public static void DecodeCommandInputBegin(byte[] payload, out string commandId, out string contentType, out long length, out byte[] sha256)
         {
             using (var stream = NewStream(payload))
             using (var reader = NewReader(stream))
             {
-                byte[] id = reader.ReadBytes(16);
-                if (id.Length != 16) throw new EndOfStreamException();
-                bundleId = new Guid(id);
-                assemblyIndex = reader.ReadInt32();
-                pdb = reader.ReadBoolean();
+                commandId = ReadString(reader);
+                contentType = ReadString(reader);
                 length = reader.ReadInt64();
                 sha256 = reader.ReadBytes(32);
-                if (assemblyIndex < 0 || length < 0 || sha256.Length != 32) throw new InvalidDataException("Invalid assembly begin message.");
+                if (length < 0 || length > MaxCommandRequestBytes || sha256.Length != 32)
+                    throw new InvalidDataException("Invalid command input metadata.");
                 EnsureEnd(stream);
+                ValidateCommandInputIdentity(commandId, contentType);
             }
         }
 
-        public static byte[] EncodeChunk(Guid bundleId, int assemblyIndex, bool pdb, long offset, byte[] data, int count)
+        public static byte[] EncodeCommandChunk(long offset, byte[] data, int dataOffset, int count)
         {
-            if (data == null || count < 0 || count > MaxChunkBytes || count > data.Length || offset < 0)
-                throw new InvalidDataException("Invalid assembly chunk.");
-            using (var stream = new MemoryStream(37 + count))
+            if (data == null || offset < 0 || dataOffset < 0 || count < 0 ||
+                count > MaxChunkBytes || dataOffset > data.Length - count)
+                throw new InvalidDataException("Invalid command chunk.");
+            using (var stream = new MemoryStream(12 + count))
             using (var writer = NewWriter(stream))
             {
-                writer.Write(bundleId.ToByteArray());
-                writer.Write(assemblyIndex);
-                writer.Write(pdb);
                 writer.Write(offset);
                 writer.Write(count);
-                writer.Write(data, 0, count);
+                writer.Write(data, dataOffset, count);
                 return stream.ToArray();
             }
         }
 
-        public static void DecodeChunk(byte[] payload, out Guid bundleId, out int assemblyIndex, out bool pdb, out long offset, out byte[] data)
+        public static void DecodeCommandChunk(byte[] payload, out long offset, out byte[] data)
         {
             using (var stream = NewStream(payload))
             using (var reader = NewReader(stream))
             {
-                byte[] id = reader.ReadBytes(16);
-                if (id.Length != 16) throw new EndOfStreamException();
-                bundleId = new Guid(id);
-                assemblyIndex = reader.ReadInt32();
-                pdb = reader.ReadBoolean();
                 offset = reader.ReadInt64();
                 int count = reader.ReadInt32();
-                if (assemblyIndex < 0 || offset < 0 || count < 0 || count > MaxChunkBytes || count > stream.Length - stream.Position)
-                    throw new InvalidDataException("Invalid assembly chunk bounds.");
+                if (offset < 0 || count < 0 || count > MaxChunkBytes || count > stream.Length - stream.Position)
+                    throw new InvalidDataException("Invalid command chunk bounds.");
                 data = reader.ReadBytes(count);
                 if (data.Length != count) throw new EndOfStreamException();
                 EnsureEnd(stream);
             }
         }
 
-        public static byte[] EncodeAssemblyEnd(Guid bundleId, int assemblyIndex, bool pdb)
+        public static byte[] EncodeCommandEnd() => Array.Empty<byte>();
+
+        public static void DecodeCommandEnd(byte[] payload)
         {
+            if (payload == null || payload.Length != 0) throw new InvalidDataException("Invalid command end message.");
+        }
+
+        public static byte[] EncodeCommandResult(bool succeeded, string code, string message, string contentType, byte[] payload)
+        {
+            ValidateCommandResult(succeeded, code, message, contentType);
+            payload = payload ?? Array.Empty<byte>();
+            if (payload.Length > MaxCommandResponseBytes) throw new InvalidDataException("Command result exceeds the maximum size.");
             using (var stream = new MemoryStream())
             using (var writer = NewWriter(stream))
             {
-                writer.Write(bundleId.ToByteArray());
-                writer.Write(assemblyIndex);
-                writer.Write(pdb);
-                return stream.ToArray();
-            }
-        }
-
-        public static void DecodeAssemblyEnd(byte[] payload, out Guid bundleId, out int assemblyIndex, out bool pdb)
-        {
-            using (var stream = NewStream(payload))
-            using (var reader = NewReader(stream))
-            {
-                byte[] id = reader.ReadBytes(16);
-                if (id.Length != 16) throw new EndOfStreamException();
-                bundleId = new Guid(id);
-                assemblyIndex = reader.ReadInt32();
-                pdb = reader.ReadBoolean();
-                EnsureEnd(stream);
-            }
-        }
-
-        public static byte[] EncodeBundleComplete(Guid bundleId)
-        {
-            return bundleId.ToByteArray();
-        }
-
-        public static Guid DecodeBundleComplete(byte[] payload)
-        {
-            if (payload == null || payload.Length != 16) throw new InvalidDataException("Invalid bundle completion message.");
-            return new Guid(payload);
-        }
-
-        public static byte[] EncodeMethods(IReadOnlyList<RemoteMethodInfo> methods)
-        {
-            if (methods == null || methods.Count > ushort.MaxValue) throw new InvalidDataException("Too many methods.");
-            using (var stream = new MemoryStream())
-            using (var writer = NewWriter(stream))
-            {
-                writer.Write((ushort)methods.Count);
-                foreach (var method in methods)
+                writer.Write(succeeded);
+                WriteString(writer, code);
+                WriteString(writer, message);
+                WriteString(writer, contentType);
+                writer.Write((long)payload.Length);
+                if (payload.Length > 0)
                 {
-                    WriteString(writer, method.Id);
-                    WriteString(writer, method.Description);
-                    writer.Write(method.TimeoutSeconds);
+                    using (var sha = SHA256.Create()) writer.Write(sha.ComputeHash(payload));
                 }
-                return stream.ToArray();
-            }
-        }
-
-        public static RemoteMethodInfo[] DecodeMethods(byte[] payload)
-        {
-            using (var stream = NewStream(payload))
-            using (var reader = NewReader(stream))
-            {
-                int count = reader.ReadUInt16();
-                var methods = new RemoteMethodInfo[count];
-                for (int i = 0; i < count; i++)
-                {
-                    methods[i] = new RemoteMethodInfo
-                    {
-                        Id = ReadString(reader),
-                        Description = ReadString(reader),
-                        TimeoutSeconds = reader.ReadInt32()
-                    };
-                }
-                EnsureEnd(stream);
-                return methods;
-            }
-        }
-
-        public static byte[] EncodeInvoke(string methodId)
-        {
-            using (var stream = new MemoryStream())
-            using (var writer = NewWriter(stream))
-            {
-                WriteString(writer, methodId);
-                return stream.ToArray();
-            }
-        }
-
-        public static string DecodeInvoke(byte[] payload)
-        {
-            using (var stream = NewStream(payload))
-            using (var reader = NewReader(stream))
-            {
-                string result = ReadString(reader);
-                EnsureEnd(stream);
+                byte[] result = stream.ToArray();
+                if (result.Length > MaxFramePayload) throw new InvalidDataException("Command result metadata is too large.");
                 return result;
             }
         }
 
+        public static void DecodeCommandResult(byte[] payload, out bool succeeded, out string code, out string message,
+            out string contentType, out long length, out byte[] sha256)
+        {
+            using (var stream = NewStream(payload))
+            using (var reader = NewReader(stream))
+            {
+                succeeded = reader.ReadBoolean();
+                code = ReadString(reader);
+                message = ReadString(reader);
+                contentType = ReadString(reader);
+                length = reader.ReadInt64();
+                if (length < 0 || length > MaxCommandResponseBytes) throw new InvalidDataException("Invalid command result length.");
+                sha256 = length > 0 ? reader.ReadBytes(32) : Array.Empty<byte>();
+                if (length > 0 && sha256.Length != 32) throw new InvalidDataException("Invalid command result hash.");
+                EnsureEnd(stream);
+                ValidateCommandResult(succeeded, code, message, contentType);
+            }
+        }
+
+        public static byte[] EncodeCommandResultChunk(long offset, byte[] data,
+            int dataOffset, int count)
+        {
+            return EncodeCommandChunk(offset, data, dataOffset, count);
+        }
+
+        public static void DecodeCommandResultChunk(byte[] payload, out long offset, out byte[] data)
+        {
+            DecodeCommandChunk(payload, out offset, out data);
+        }
+
+        public static byte[] EncodeCommandResultEnd() => Array.Empty<byte>();
+
+        public static void DecodeCommandResultEnd(byte[] payload)
+        {
+            DecodeCommandEnd(payload);
+        }
+
         public static byte[] EncodeResult(bool succeeded, string code, string message)
         {
+            if (!IsValidString(code) || !IsValidString(message) ||
+                (!succeeded && string.IsNullOrWhiteSpace(code)))
+                throw new InvalidDataException("Invalid result metadata.");
             using (var stream = new MemoryStream())
             using (var writer = NewWriter(stream))
             {
@@ -442,6 +377,9 @@ namespace HybridCLR.RemoteExecution
                 code = ReadString(reader);
                 message = ReadString(reader);
                 EnsureEnd(stream);
+                if (!IsValidString(code) || !IsValidString(message) ||
+                    (!succeeded && string.IsNullOrWhiteSpace(code)))
+                    throw new InvalidDataException("Invalid result metadata.");
             }
         }
 
@@ -453,21 +391,47 @@ namespace HybridCLR.RemoteExecution
             return new RemoteError { Code = code, Message = message };
         }
 
-        private static void ValidateAssemblyInfo(RemoteAssemblyInfo assembly)
+        private static void ValidateCommandInfo(RemoteCommandInfo command)
         {
-            if (assembly == null || string.IsNullOrEmpty(assembly.Name) || assembly.DllLength <= 0 || assembly.DllLength > DefaultMaxBundleBytes ||
-                assembly.PdbLength < 0 || assembly.PdbLength > DefaultMaxBundleBytes || assembly.DllSha256 == null || assembly.DllSha256.Length != 32 ||
-                (assembly.PdbLength > 0 && (assembly.PdbSha256 == null || assembly.PdbSha256.Length != 32)))
-                throw new InvalidDataException("Invalid assembly manifest entry.");
+            if (command == null || string.IsNullOrWhiteSpace(command.Id) ||
+                string.IsNullOrWhiteSpace(command.Name) || string.IsNullOrWhiteSpace(command.Description) ||
+                !IsValidString(command.Id) || !IsValidString(command.Name) ||
+                !IsValidString(command.Description) || !IsValidString(command.Category) ||
+                !IsValidString(command.RequestContentType) || !IsValidString(command.ResponseContentType) ||
+                command.MaxRequestBytes < 0 || command.MaxRequestBytes > MaxCommandRequestBytes ||
+                command.MaxResponseBytes < 0 || command.MaxResponseBytes > MaxCommandResponseBytes ||
+                command.TimeoutSeconds < 1 || command.TimeoutSeconds > 3600)
+                throw new InvalidDataException("Invalid command metadata.");
         }
 
-        private static BinaryWriter NewWriter(Stream stream) => new BinaryWriter(stream, Encoding.UTF8, true);
-        private static BinaryReader NewReader(Stream stream) => new BinaryReader(stream, Encoding.UTF8, true);
+        private static bool IsValidString(string value)
+        {
+            try { return s_Utf8.GetByteCount(value ?? string.Empty) <= MaxStringBytes; }
+            catch (EncoderFallbackException) { return false; }
+        }
+
+        private static void ValidateCommandInputIdentity(string commandId, string contentType)
+        {
+            if (string.IsNullOrWhiteSpace(commandId) || !IsValidString(commandId) ||
+                !IsValidString(contentType))
+                throw new InvalidDataException("Invalid command ID or content type.");
+        }
+
+        private static void ValidateCommandResult(bool succeeded, string code, string message,
+            string contentType)
+        {
+            if (!IsValidString(code) || !IsValidString(message) || !IsValidString(contentType) ||
+                (!succeeded && string.IsNullOrWhiteSpace(code)))
+                throw new InvalidDataException("Invalid command result metadata.");
+        }
+
+        private static BinaryWriter NewWriter(Stream stream) => new BinaryWriter(stream, s_Utf8, true);
+        private static BinaryReader NewReader(Stream stream) => new BinaryReader(stream, s_Utf8, true);
         private static MemoryStream NewStream(byte[] data) => new MemoryStream(data ?? throw new ArgumentNullException(nameof(data)), false);
 
         private static void WriteString(BinaryWriter writer, string value)
         {
-            byte[] bytes = Encoding.UTF8.GetBytes(value ?? string.Empty);
+            byte[] bytes = s_Utf8.GetBytes(value ?? string.Empty);
             if (bytes.Length > MaxStringBytes) throw new InvalidDataException("Remote execution string is too long.");
             writer.Write((ushort)bytes.Length);
             writer.Write(bytes);
@@ -479,7 +443,7 @@ namespace HybridCLR.RemoteExecution
             if (length > MaxStringBytes) throw new InvalidDataException("Remote execution string is too long.");
             byte[] bytes = reader.ReadBytes(length);
             if (bytes.Length != length) throw new EndOfStreamException();
-            return Encoding.UTF8.GetString(bytes);
+            return s_Utf8.GetString(bytes);
         }
 
         private static void EnsureEnd(Stream stream)

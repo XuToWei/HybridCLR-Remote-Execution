@@ -1,8 +1,12 @@
 {
-  "name": "HybridCLR.RemoteExecution.Editor",
-  "rootNamespace": "HybridCLR.RemoteExecution",
-  "references": ["HybridCLR.RemoteExecution.Runtime", "HybridCLR.Editor"],
-  "includePlatforms": ["Editor"],
+  "name": "RemoteExecution.Editor",
+  "rootNamespace": "RemoteExecution",
+  "references": [
+    "RemoteExecution.Runtime"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
   "excludePlatforms": [],
   "allowUnsafeCode": false,
   "overrideReferences": false,

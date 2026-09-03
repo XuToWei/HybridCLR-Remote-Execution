@@ -6,31 +6,36 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
-using HybridCLR;
 using UnityEngine;
 
-namespace HybridCLR.RemoteExecution
+namespace RemoteExecution
 {
-    /// <summary>Development Player client for the HybridCLR Remote Execution editor host.</summary>
     public sealed class RemoteExecutionComponent : MonoBehaviour
     {
         [SerializeField] private RemoteExecutionSettings m_Configuration;
         private readonly Queue<Action> m_MainThreadActions = new Queue<Action>();
         private readonly object m_ActionLock = new object();
-        private readonly Dictionary<string, RemoteCallableDescriptor> m_Methods = new Dictionary<string, RemoteCallableDescriptor>(StringComparer.Ordinal);
-        private readonly Dictionary<string, Assembly> m_Assemblies = new Dictionary<string, Assembly>(StringComparer.Ordinal);
-        private readonly Dictionary<string, byte[]> m_AssemblyHashes = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         private readonly Queue<RemoteFrame> m_SendQueue = new Queue<RemoteFrame>();
         private readonly object m_SendLock = new object();
+        private readonly HashSet<Guid> m_ActiveRequestIds = new HashSet<Guid>();
+        private static readonly object s_ComponentLock = new object();
+        private static RemoteExecutionComponent s_RegistryOwner;
+        private readonly List<RemoteCommandDescriptor> m_Registrations = new List<RemoteCommandDescriptor>();
         private CancellationTokenSource m_Cancellation;
         private SemaphoreSlim m_SendSignal;
         private TcpClient m_Client;
         private NetworkStream m_Stream;
-        private bool m_Authenticated;
-        private bool m_InvocationRunning;
-        private IncomingBundle m_IncomingBundle;
+        private bool m_IsReady;
+        private readonly object m_CommandLock = new object();
+        private bool m_CommandRunning;
+        private Guid m_RunningCommandId;
+        private CancellationTokenSource m_CommandCancellation;
+        private DateTime m_CommandDeadlineUtc;
+        private bool m_CommandCancelledRemotely;
+        private bool m_Started;
+        private IncomingCommandInput m_IncomingCommandInput;
 
-        public bool IsConnected => m_Client != null && m_Client.Connected && m_Authenticated;
+        public bool IsConnected => m_Client != null && m_Client.Connected && m_IsReady;
 
         private void Awake()
         {
@@ -38,24 +43,33 @@ namespace HybridCLR.RemoteExecution
             enabled = false;
             return;
 #else
-            if (m_Configuration == null || !m_Configuration.Enabled || !Debug.isDebugBuild || string.IsNullOrEmpty(m_Configuration.AuthenticationToken))
+            if (m_Configuration == null || !m_Configuration.Enabled)
             {
                 enabled = false;
                 return;
             }
-            DontDestroyOnLoad(gameObject);
-            RefreshMethods(AppDomain.CurrentDomain.GetAssemblies());
-#if ENABLE_IL2CPP
-            if (m_Configuration.LoadAotMetadata)
+            lock (s_ComponentLock)
             {
-                foreach (TextAsset asset in m_Configuration.AotMetadataAssemblies ?? Array.Empty<TextAsset>())
+                if (s_RegistryOwner != null && s_RegistryOwner != this)
                 {
-                    if (asset != null) RuntimeApi.LoadMetadataForAOTAssembly(asset.bytes, HomologousImageMode.Consistent);
+                    Debug.LogWarning("[Unity.RemoteExecution] only one active component is supported.");
+                    enabled = false;
+                    return;
                 }
+                s_RegistryOwner = this;
             }
+            DontDestroyOnLoad(gameObject);
 #endif
+        }
+
+        private void Start()
+        {
+#if !UNITY_EDITOR
+            if (!enabled) return;
             m_Cancellation = new CancellationTokenSource();
             m_SendSignal = new SemaphoreSlim(0);
+            m_Started = true;
+            DiscoverAndRegisterCommands();
             ConnectAsync(m_Cancellation.Token).Forget();
 #endif
         }
@@ -73,13 +87,34 @@ namespace HybridCLR.RemoteExecution
                 try { action(); }
                 catch (Exception exception) { Debug.LogException(exception); }
             }
+            lock (m_CommandLock)
+            {
+                if (m_CommandRunning && DateTime.UtcNow >= m_CommandDeadlineUtc)
+                    m_CommandCancellation?.Cancel();
+            }
         }
 
-        private void OnDestroy() { Disconnect(); }
+        private void OnDestroy()
+        {
+            Disconnect();
+            if (m_Started && m_Registrations.Count > 0)
+            {
+                try { RemoteCommandRegistry.Unregister(m_Registrations); }
+                catch (Exception exception)
+                {
+                    Debug.LogWarning($"[Unity.RemoteExecution] registry cleanup was incomplete: {exception.Message}");
+                }
+            }
+            lock (s_ComponentLock)
+            {
+                if (s_RegistryOwner == this) s_RegistryOwner = null;
+            }
+        }
 
         public void Disconnect()
         {
             m_Cancellation?.Cancel();
+            lock (m_CommandLock) m_CommandCancellation?.Cancel();
             m_Stream?.Close();
             m_Client?.Close();
             if (m_SendSignal != null)
@@ -92,8 +127,68 @@ namespace HybridCLR.RemoteExecution
             m_SendSignal = null;
             m_Stream = null;
             m_Client = null;
-            m_Authenticated = false;
-            m_IncomingBundle = null;
+            m_IsReady = false;
+            ResetCommandInput();
+            lock (m_CommandLock) m_ActiveRequestIds.Clear();
+        }
+
+        private void DiscoverAndRegisterCommands()
+        {
+            Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            RegisterProviders(assemblies);
+            try
+            {
+                IReadOnlyList<RemoteCommandDescriptor> registered =
+                    RemoteCommandRegistry.RegisterAttributeCommands(assemblies);
+                m_Registrations.AddRange(registered);
+            }
+            catch (Exception exception) { Debug.LogException(exception); }
+        }
+
+        private void RegisterProviders(IEnumerable<Assembly> assemblies)
+        {
+            var providerTypes = new List<Type>();
+            foreach (Assembly assembly in assemblies ?? Array.Empty<Assembly>())
+            {
+                foreach (Type type in RemoteCommandRegistry.GetLoadableTypes(assembly))
+                {
+                    if (!IsProviderType(type)) continue;
+                    providerTypes.Add(type);
+                }
+            }
+            providerTypes.Sort(CompareProviderTypes);
+            foreach (Type providerType in providerTypes)
+                TryRegisterProvider(providerType);
+        }
+
+        private static bool IsProviderType(Type type)
+        {
+            return type != null && type.IsClass && !type.IsAbstract && !type.ContainsGenericParameters &&
+                typeof(IRemoteCommandProvider).IsAssignableFrom(type) &&
+                !typeof(UnityEngine.Object).IsAssignableFrom(type) &&
+                type.GetConstructor(Type.EmptyTypes) != null;
+        }
+
+        private static int CompareProviderTypes(Type left, Type right)
+        {
+            int assemblyComparison = StringComparer.Ordinal.Compare(left.Assembly.FullName, right.Assembly.FullName);
+            return assemblyComparison != 0 ? assemblyComparison :
+                StringComparer.Ordinal.Compare(left.FullName ?? left.Name, right.FullName ?? right.Name);
+        }
+
+        private void TryRegisterProvider(Type providerType)
+        {
+            try
+            {
+                var provider = (IRemoteCommandProvider)Activator.CreateInstance(providerType);
+                IReadOnlyList<RemoteCommandDescriptor> registered =
+                    RemoteCommandRegistry.RegisterProvider(provider);
+                m_Registrations.AddRange(registered);
+            }
+            catch (Exception exception)
+            {
+                Debug.LogError($"[Unity.RemoteExecution] provider '{providerType.AssemblyQualifiedName}' failed: {exception.Message}");
+            }
         }
 
         private async Task ConnectAsync(CancellationToken cancellationToken)
@@ -108,46 +203,38 @@ namespace HybridCLR.RemoteExecution
                     ClientId = string.IsNullOrEmpty(m_Configuration.ClientId) ? SystemInfo.deviceUniqueIdentifier : m_Configuration.ClientId,
                     Target = GetRuntimeTarget(),
                     UnityVersion = Application.unityVersion,
-                    HybridCLRVersion = "HybridCLR"
+                    RuntimeVersion = "Unity Remote Execution"
                 };
+                Guid helloRequestId = Guid.NewGuid();
                 await RemoteExecutionProtocol.WriteFrameAsync(m_Stream,
-                    new RemoteFrame(RemoteMessageKind.Hello, Guid.NewGuid(), RemoteExecutionProtocol.EncodeHello(hello)), cancellationToken).ConfigureAwait(false);
-                Task receiveTask = ReceiveLoopAsync(cancellationToken);
+                    new RemoteFrame(RemoteMessageKind.Hello, helloRequestId,
+                        RemoteExecutionProtocol.EncodeHello(hello)), cancellationToken).ConfigureAwait(false);
+                Task receiveTask = ReceiveLoopAsync(helloRequestId, cancellationToken);
                 Task sendTask = SendLoopAsync(cancellationToken);
                 await Task.WhenAny(receiveTask, sendTask).ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (Exception exception)
-            {
-                Debug.LogWarning($"Remote execution connection stopped: {exception.Message}");
-            }
-            finally
-            {
-                Disconnect();
-            }
+            catch (OperationCanceledException) { }
+            catch (Exception exception) { Debug.LogWarning($"[Unity.RemoteExecution] connection stopped: {exception.Message}"); }
+            finally { Disconnect(); }
         }
 
-        private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
+        private async Task ReceiveLoopAsync(Guid helloRequestId,
+            CancellationToken cancellationToken)
         {
+            RemoteFrame ready = await RemoteExecutionProtocol.ReadFrameAsync(m_Stream,
+                cancellationToken).ConfigureAwait(false);
+            if (ready.Kind != RemoteMessageKind.Ready ||
+                ready.RequestId != helloRequestId || ready.Payload.Length != 0)
+                throw new InvalidDataException(
+                    "Ready must acknowledge the Hello request with an empty payload.");
+            m_IsReady = true;
             while (!cancellationToken.IsCancellationRequested)
             {
-                RemoteFrame frame = await RemoteExecutionProtocol.ReadFrameAsync(m_Stream, cancellationToken).ConfigureAwait(false);
-                if (frame.Kind == RemoteMessageKind.Challenge)
-                {
-                    byte[] nonce = RemoteExecutionProtocol.DecodeChallenge(frame.Payload);
-                    Send(RemoteMessageKind.Authenticate, frame.RequestId,
-                        RemoteExecutionProtocol.ComputeAuthentication(nonce, m_Configuration.AuthenticationToken));
-                }
-                else if (frame.Kind == RemoteMessageKind.Ready)
-                {
-                    m_Authenticated = true;
-                }
-                else
-                {
-                    EnqueueMainThread(() => HandleFrame(frame));
-                }
+                RemoteFrame frame = await RemoteExecutionProtocol.ReadFrameAsync(m_Stream,
+                    cancellationToken).ConfigureAwait(false);
+                if (frame.Kind == RemoteMessageKind.Hello || frame.Kind == RemoteMessageKind.Ready)
+                    throw new InvalidDataException("Unexpected handshake frame.");
+                EnqueueMainThread(() => HandleFrame(frame));
             }
         }
 
@@ -176,209 +263,271 @@ namespace HybridCLR.RemoteExecution
 
         private void HandleFrame(RemoteFrame frame)
         {
-            if (!m_Authenticated) return;
+            if (!m_IsReady) return;
             try
             {
+                if (frame.RequestId == Guid.Empty &&
+                    frame.Kind != RemoteMessageKind.Ping && frame.Kind != RemoteMessageKind.Pong)
+                    throw new InvalidDataException("Request ID is required.");
                 switch (frame.Kind)
                 {
-                    case RemoteMessageKind.ListMethods:
-                        Send(RemoteMessageKind.Methods, frame.RequestId, EncodeMethods());
+                    case RemoteMessageKind.ListCommands:
+                        Send(RemoteMessageKind.Commands, frame.RequestId, EncodeCommands());
                         break;
-                    case RemoteMessageKind.Invoke:
-                        HandleInvoke(frame);
+                    case RemoteMessageKind.CommandInputBegin:
+                        BeginCommandInput(frame);
                         break;
-                    case RemoteMessageKind.LoadManifest:
-                        BeginBundle(frame);
+                    case RemoteMessageKind.CommandInputChunk:
+                        WriteCommandChunk(frame);
                         break;
-                    case RemoteMessageKind.AssemblyBegin:
-                        BeginAssembly(frame);
+                    case RemoteMessageKind.CommandInputEnd:
+                        EndCommandInput(frame);
                         break;
-                    case RemoteMessageKind.AssemblyChunk:
-                        WriteChunk(frame);
-                        break;
-                    case RemoteMessageKind.AssemblyEnd:
-                        EndAssembly(frame);
-                        break;
-                    case RemoteMessageKind.LoadComplete:
-                        CompleteBundle(frame);
+                    case RemoteMessageKind.CancelCommand:
+                        CancelCommand(frame);
                         break;
                     case RemoteMessageKind.Ping:
                         Send(RemoteMessageKind.Pong, frame.RequestId, Array.Empty<byte>());
                         break;
+                    default:
+                        Send(RemoteMessageKind.Error, frame.RequestId,
+                            RemoteExecutionProtocol.EncodeError("UNKNOWN_MESSAGE", frame.Kind.ToString()));
+                        break;
                 }
             }
             catch (Exception exception)
             {
-                Guid responseRequestId = frame.Kind == RemoteMessageKind.Invoke
-                    ? frame.RequestId : m_IncomingBundle?.RequestId ?? frame.RequestId;
-                m_IncomingBundle = null;
-                RemoteMessageKind resultKind = frame.Kind == RemoteMessageKind.Invoke
-                    ? RemoteMessageKind.InvokeResult : RemoteMessageKind.ApplyResult;
-                Send(resultKind, responseRequestId,
-                    RemoteExecutionProtocol.EncodeResult(false, "PROTOCOL_ERROR", exception.Message));
+                ResetCommandInput();
+                bool isCommand = IsCommandMessage(frame.Kind);
+                Send(isCommand ? RemoteMessageKind.CommandResult : RemoteMessageKind.Error, frame.RequestId,
+                    isCommand
+                        ? RemoteExecutionProtocol.EncodeCommandResult(false, "PROTOCOL_ERROR", exception.Message,
+                            string.Empty, null)
+                        : RemoteExecutionProtocol.EncodeError("PROTOCOL_ERROR", exception.Message));
             }
         }
 
-        private void HandleInvoke(RemoteFrame frame)
+        private void ScheduleCommand(Guid requestId, RemoteCommandDescriptor descriptor,
+            byte[] payload, string contentType)
         {
-            if (m_InvocationRunning)
-            {
-                Send(RemoteMessageKind.InvokeResult, frame.RequestId,
-                    RemoteExecutionProtocol.EncodeResult(false, "INVOCATION_BUSY", "Another remote invocation is running."));
-                return;
-            }
-            string methodId = RemoteExecutionProtocol.DecodeInvoke(frame.Payload);
-            if (!m_Methods.TryGetValue(methodId, out RemoteCallableDescriptor descriptor))
-            {
-                Send(RemoteMessageKind.InvokeResult, frame.RequestId,
-                    RemoteExecutionProtocol.EncodeResult(false, "METHOD_NOT_FOUND", methodId));
-                return;
-            }
-            m_InvocationRunning = true;
-            InvokeAsync(frame.RequestId, descriptor).Forget();
+            if (descriptor.RequiresMainThread)
+                ExecuteCommand(requestId, descriptor, payload, contentType).Forget();
+            else
+                Task.Run(() => ExecuteCommand(requestId, descriptor, payload, contentType)).Forget();
         }
 
-        private async Task InvokeAsync(Guid requestId, RemoteCallableDescriptor descriptor)
+        private async Task ExecuteCommand(Guid requestId, RemoteCommandDescriptor descriptor, byte[] payload,
+            string contentType)
         {
+            CancellationTokenSource commandCancellation;
+            lock (m_CommandLock)
+            {
+                if (m_CommandRunning)
+                {
+                    Send(RemoteMessageKind.CommandResult, requestId,
+                        RemoteExecutionProtocol.EncodeCommandResult(false, "COMMAND_BUSY",
+                            "Another command is running.", string.Empty, null));
+                    EndRequest(requestId);
+                    return;
+                }
+                m_CommandRunning = true;
+                m_RunningCommandId = requestId;
+                commandCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                    m_Cancellation?.Token ?? CancellationToken.None);
+                m_CommandCancellation = commandCancellation;
+                m_CommandDeadlineUtc = DateTime.UtcNow.AddSeconds(descriptor.TimeoutSeconds);
+                m_CommandCancelledRemotely = false;
+            }
             try
             {
-                await RemoteCallableRegistry.InvokeAsync(descriptor);
-                Send(RemoteMessageKind.InvokeResult, requestId, RemoteExecutionProtocol.EncodeResult(true, "", ""));
+                var context = new RemoteCommandContext(descriptor.Id, "Editor", payload,
+                    contentType, commandCancellation.Token);
+                Task<RemoteCommandResult> execution = RemoteCommandRegistry.ExecuteAsync(
+                    descriptor, context, commandCancellation.Token);
+                if (descriptor.RequiresMainThread && !execution.IsCompleted)
+                    Debug.LogWarning($"[Unity.RemoteExecution] command '{descriptor.Id}' continued asynchronously; " +
+                        "code after the first await is not guaranteed to run on the Unity main thread.");
+                RemoteCommandResult result = await execution.ConfigureAwait(false);
+                SendCommandResult(requestId, result);
+            }
+            catch (OperationCanceledException)
+            {
+                bool cancelledRemotely;
+                lock (m_CommandLock) cancelledRemotely = m_CommandCancelledRemotely;
+                string code = cancelledRemotely ? "COMMAND_CANCELLED" : "COMMAND_TIMED_OUT";
+                string message = cancelledRemotely ? "Command was cancelled." : "Command timed out.";
+                Send(RemoteMessageKind.CommandResult, requestId,
+                    RemoteExecutionProtocol.EncodeCommandResult(false, code, message,
+                        string.Empty, null));
             }
             catch (Exception exception)
             {
-                Send(RemoteMessageKind.InvokeResult, requestId,
-                    RemoteExecutionProtocol.EncodeResult(false, "METHOD_EXECUTION_FAILED", exception.Message));
+                Send(RemoteMessageKind.CommandResult, requestId,
+                    RemoteExecutionProtocol.EncodeCommandResult(false, "COMMAND_EXECUTION_FAILED",
+                        exception.Message, string.Empty, null));
             }
             finally
             {
-                m_InvocationRunning = false;
+                lock (m_CommandLock)
+                {
+                    if (ReferenceEquals(m_CommandCancellation, commandCancellation))
+                    {
+                        m_CommandCancellation = null;
+                        m_RunningCommandId = Guid.Empty;
+                        m_CommandDeadlineUtc = default(DateTime);
+                        m_CommandCancelledRemotely = false;
+                        m_CommandRunning = false;
+                    }
+                }
+                commandCancellation.Dispose();
+                EndRequest(requestId);
             }
         }
 
-        private void BeginBundle(RemoteFrame frame)
+        private void SendCommandResult(Guid requestId, RemoteCommandResult result)
         {
-            if (m_IncomingBundle != null) throw new InvalidDataException("Another bundle is already being received.");
-            RemoteBundleManifest manifest = RemoteExecutionProtocol.DecodeManifest(frame.Payload);
-            string target = GetRuntimeTarget();
-            if (!string.Equals(manifest.Target, target, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException($"Bundle target '{manifest.Target}' does not match '{target}'.");
-            long total = 0;
-            foreach (RemoteAssemblyInfo assembly in manifest.Assemblies) total = checked(total + assembly.DllLength + assembly.PdbLength);
-            if (total > m_Configuration.MaxBundleBytes) throw new InvalidDataException("Bundle exceeds the configured size limit.");
-            m_IncomingBundle = new IncomingBundle(manifest, frame.RequestId);
+            byte[] payload = result.Payload ?? Array.Empty<byte>();
+            if (payload.Length > m_Configuration.MaxCommandResponseBytes)
+                throw new InvalidDataException("Command result exceeds the configured response limit.");
+            Send(RemoteMessageKind.CommandResult, requestId,
+                RemoteExecutionProtocol.EncodeCommandResult(result.Succeeded, result.Code, result.Message, result.ContentType, payload));
+            if (payload.Length == 0) return;
+            for (int offset = 0; offset < payload.Length; offset += RemoteExecutionProtocol.MaxChunkBytes)
+            {
+                int count = Math.Min(RemoteExecutionProtocol.MaxChunkBytes, payload.Length - offset);
+                Send(RemoteMessageKind.CommandResultChunk, requestId,
+                    RemoteExecutionProtocol.EncodeCommandResultChunk(offset, payload, offset, count));
+            }
+            Send(RemoteMessageKind.CommandResultEnd, requestId, RemoteExecutionProtocol.EncodeCommandResultEnd());
         }
 
-        private void BeginAssembly(RemoteFrame frame)
+        private void ResetCommandInput()
         {
-            EnsureBundle();
-            RemoteExecutionProtocol.DecodeAssemblyBegin(frame.Payload, out Guid bundleId, out int index, out bool pdb, out long length, out byte[] hash);
-            if (bundleId != m_IncomingBundle.Manifest.BundleId || index < 0 || index >= m_IncomingBundle.Assemblies.Length)
-                throw new InvalidDataException("Assembly does not belong to the active bundle.");
-            RemoteAssemblyInfo info = m_IncomingBundle.Manifest.Assemblies[index];
-            long expectedLength = pdb ? info.PdbLength : info.DllLength;
-            if (length != expectedLength || !RemoteExecutionProtocol.FixedTimeEquals(hash, pdb ? info.PdbSha256 : info.DllSha256))
-                throw new InvalidDataException("Assembly metadata does not match the manifest.");
-            IncomingAssembly received = m_IncomingBundle.Assemblies[index];
-            if (pdb ? received.Pdb != null : received.Dll != null) throw new InvalidDataException("Duplicate assembly begin.");
-            var stream = new MemoryStream(checked((int)length));
-            if (pdb) received.Pdb = stream; else received.Dll = stream;
+            IncomingCommandInput input = m_IncomingCommandInput;
+            m_IncomingCommandInput = null;
+            input?.CommandPayload.Dispose();
         }
 
-        private void WriteChunk(RemoteFrame frame)
+        private void BeginCommandInput(RemoteFrame frame)
         {
-            EnsureBundle();
-            RemoteExecutionProtocol.DecodeChunk(frame.Payload, out Guid bundleId, out int index, out bool pdb, out long offset, out byte[] data);
-            if (bundleId != m_IncomingBundle.Manifest.BundleId || index < 0 || index >= m_IncomingBundle.Assemblies.Length)
-                throw new InvalidDataException("Chunk does not belong to the active bundle.");
-            MemoryStream stream = pdb ? m_IncomingBundle.Assemblies[index].Pdb : m_IncomingBundle.Assemblies[index].Dll;
-            if (stream == null || stream.Position != offset || stream.Length + data.Length > stream.Capacity)
-                throw new InvalidDataException("Assembly chunk is out of order or too large.");
+            if (m_IncomingCommandInput != null) throw new InvalidOperationException("Another transfer is active.");
+            RemoteExecutionProtocol.DecodeCommandInputBegin(frame.Payload, out string commandId, out string contentType,
+                out long length, out byte[] hash);
+            if (!RemoteCommandRegistry.TryGet(commandId, out RemoteCommandDescriptor descriptor) || !descriptor.IsExecutable)
+                throw new InvalidOperationException("Command is not executable.");
+            if (length > descriptor.MaxRequestBytes || length > m_Configuration.MaxCommandRequestBytes ||
+                !ContentTypeMatches(descriptor.RequestContentType, contentType))
+                throw new InvalidDataException("Command input exceeds the command limits.");
+            BeginRequest(frame.RequestId);
+            m_IncomingCommandInput = IncomingCommandInput.Create(frame.RequestId, commandId,
+                contentType, length, hash);
+        }
+
+        private void WriteCommandChunk(RemoteFrame frame)
+        {
+            EnsureCommandInput(frame.RequestId);
+            RemoteExecutionProtocol.DecodeCommandChunk(frame.Payload, out long offset, out byte[] data);
+            MemoryStream stream = m_IncomingCommandInput.CommandPayload;
+            if (stream.Position != offset || stream.Length + data.Length > stream.Capacity)
+                throw new InvalidDataException("Command chunk is out of order or too large.");
             stream.Write(data, 0, data.Length);
         }
 
-        private void EndAssembly(RemoteFrame frame)
+        private void EndCommandInput(RemoteFrame frame)
         {
-            EnsureBundle();
-            RemoteExecutionProtocol.DecodeAssemblyEnd(frame.Payload, out Guid bundleId, out int index, out bool pdb);
-            if (bundleId != m_IncomingBundle.Manifest.BundleId || index < 0 || index >= m_IncomingBundle.Assemblies.Length)
-                throw new InvalidDataException("Assembly end does not belong to the active bundle.");
-            IncomingAssembly received = m_IncomingBundle.Assemblies[index];
-            MemoryStream stream = pdb ? received.Pdb : received.Dll;
-            if (stream == null || (pdb ? received.PdbComplete : received.DllComplete)) throw new InvalidDataException("Invalid assembly end.");
-            RemoteAssemblyInfo info = m_IncomingBundle.Manifest.Assemblies[index];
-            if (stream.Length != (pdb ? info.PdbLength : info.DllLength)) throw new InvalidDataException("Assembly length does not match.");
-            byte[] actual;
-            using (var sha = SHA256.Create()) actual = sha.ComputeHash(stream.ToArray());
-            if (!RemoteExecutionProtocol.FixedTimeEquals(actual, pdb ? info.PdbSha256 : info.DllSha256)) throw new InvalidDataException("Assembly hash does not match.");
-            if (pdb) received.PdbComplete = true; else received.DllComplete = true;
-        }
-
-        private void CompleteBundle(RemoteFrame frame)
-        {
-            EnsureBundle();
-            Guid bundleId = RemoteExecutionProtocol.DecodeBundleComplete(frame.Payload);
-            if (bundleId != m_IncomingBundle.Manifest.BundleId || !m_IncomingBundle.IsComplete())
-                throw new InvalidDataException("Bundle is incomplete.");
-            ApplyBundle();
-        }
-
-        private void ApplyBundle()
-        {
-            IncomingBundle bundle = m_IncomingBundle;
+            EnsureCommandInput(frame.RequestId);
+            RemoteExecutionProtocol.DecodeCommandEnd(frame.Payload);
+            IncomingCommandInput input = m_IncomingCommandInput;
+            m_IncomingCommandInput = null;
+            byte[] bytes;
             try
             {
-                var loaded = new List<Assembly>();
-                for (int i = 0; i < bundle.Assemblies.Length; i++)
+                if (input.CommandPayload.Length != input.Length)
+                    throw new InvalidDataException("Command input length mismatch.");
+                bytes = input.CommandPayload.ToArray();
+                using (var sha = SHA256.Create())
                 {
-                    RemoteAssemblyInfo info = bundle.Manifest.Assemblies[i];
-                    byte[] dll = bundle.Assemblies[i].Dll.ToArray();
-                    if (m_Assemblies.TryGetValue(info.Name, out Assembly _))
-                    {
-                        if (!RemoteExecutionProtocol.FixedTimeEquals(m_AssemblyHashes[info.Name], info.DllSha256))
-                            throw new InvalidOperationException($"Assembly '{info.Name}' is already loaded with another version.");
-                        continue;
-                    }
-                    Assembly assembly = info.PdbLength > 0 ? Assembly.Load(dll, bundle.Assemblies[i].Pdb.ToArray()) : Assembly.Load(dll);
-                    m_Assemblies.Add(info.Name, assembly);
-                    m_AssemblyHashes.Add(info.Name, (byte[])info.DllSha256.Clone());
-                    loaded.Add(assembly);
+                    if (!RemoteExecutionProtocol.FixedTimeEquals(sha.ComputeHash(bytes), input.Hash))
+                        throw new InvalidDataException("Command input hash mismatch.");
                 }
-                RefreshMethods(loaded);
-                m_IncomingBundle = null;
-                Send(RemoteMessageKind.ApplyResult, bundle.RequestId,
-                    RemoteExecutionProtocol.EncodeResult(true, "", bundle.Manifest.Generation));
             }
-            catch (Exception exception)
+            finally { input.CommandPayload.Dispose(); }
+            if (!RemoteCommandRegistry.TryGet(input.CommandId, out RemoteCommandDescriptor descriptor))
+                throw new InvalidOperationException("Command is no longer registered.");
+            ScheduleCommand(frame.RequestId, descriptor, bytes, input.ContentType);
+        }
+
+        private void CancelCommand(RemoteFrame frame)
+        {
+            if (m_IncomingCommandInput != null && m_IncomingCommandInput.RequestId == frame.RequestId)
             {
-                m_IncomingBundle = null;
-                Send(RemoteMessageKind.ApplyResult, bundle.RequestId,
-                    RemoteExecutionProtocol.EncodeResult(false, "LOAD_FAILED", exception.Message));
+                ResetCommandInput();
+                EndRequest(frame.RequestId);
+            }
+            lock (m_CommandLock)
+            {
+                if (m_CommandRunning && m_RunningCommandId == frame.RequestId)
+                {
+                    m_CommandCancelledRemotely = true;
+                    m_CommandCancellation?.Cancel();
+                }
             }
         }
 
-        private void RefreshMethods(IEnumerable<Assembly> additionalAssemblies)
+        private void EnsureCommandInput(Guid requestId)
         {
-            var assemblies = new List<Assembly>();
-            var seen = new HashSet<Assembly>();
-            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
-                if (assembly != null && seen.Add(assembly)) assemblies.Add(assembly);
-            if (additionalAssemblies != null)
-            {
-                foreach (Assembly assembly in additionalAssemblies)
-                    if (assembly != null && seen.Add(assembly)) assemblies.Add(assembly);
-            }
-            IReadOnlyList<RemoteCallableDescriptor> descriptors = RemoteCallableRegistry.Discover(assemblies);
-            m_Methods.Clear();
-            foreach (RemoteCallableDescriptor descriptor in descriptors) m_Methods.Add(descriptor.Id, descriptor);
+            if (m_IncomingCommandInput == null || m_IncomingCommandInput.RequestId != requestId)
+                throw new InvalidDataException("No matching command input.");
         }
 
-        private byte[] EncodeMethods()
+        private void BeginRequest(Guid requestId)
         {
-            var methods = new List<RemoteMethodInfo>(m_Methods.Count);
-            foreach (RemoteCallableDescriptor descriptor in m_Methods.Values)
-                methods.Add(new RemoteMethodInfo { Id = descriptor.Id, Description = descriptor.Description, TimeoutSeconds = descriptor.TimeoutSeconds });
-            return RemoteExecutionProtocol.EncodeMethods(methods);
+            lock (m_CommandLock)
+            {
+                if (!m_ActiveRequestIds.Add(requestId))
+                    throw new InvalidDataException("Duplicate active request ID.");
+            }
+        }
+
+        private void EndRequest(Guid requestId)
+        {
+            lock (m_CommandLock) m_ActiveRequestIds.Remove(requestId);
+        }
+
+        private static bool IsCommandMessage(RemoteMessageKind kind)
+        {
+            return kind == RemoteMessageKind.CommandInputBegin ||
+                kind == RemoteMessageKind.CommandInputChunk ||
+                kind == RemoteMessageKind.CommandInputEnd ||
+                kind == RemoteMessageKind.CancelCommand;
+        }
+
+        private static bool ContentTypeMatches(string expected, string actual)
+        {
+            return string.IsNullOrEmpty(expected) || string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private byte[] EncodeCommands()
+        {
+            var commands = new List<RemoteCommandInfo>();
+            foreach (RemoteCommandDescriptor descriptor in RemoteCommandRegistry.Snapshot())
+            {
+                commands.Add(new RemoteCommandInfo
+                {
+                    Id = descriptor.Id,
+                    Name = descriptor.Name,
+                    Description = descriptor.Description,
+                    Category = descriptor.Category,
+                    TimeoutSeconds = descriptor.TimeoutSeconds,
+                    MaxRequestBytes = Math.Min(descriptor.MaxRequestBytes, m_Configuration.MaxCommandRequestBytes),
+                    MaxResponseBytes = Math.Min(descriptor.MaxResponseBytes, m_Configuration.MaxCommandResponseBytes),
+                    RequestContentType = descriptor.RequestContentType,
+                    ResponseContentType = descriptor.ResponseContentType,
+                    Executable = descriptor.IsExecutable,
+                    RequiresMainThread = descriptor.RequiresMainThread
+                });
+            }
+            return RemoteExecutionProtocol.EncodeCommands(commands);
         }
 
         private void Send(RemoteMessageKind kind, Guid requestId, byte[] payload)
@@ -386,11 +535,6 @@ namespace HybridCLR.RemoteExecution
             if (m_Cancellation == null || m_SendSignal == null) return;
             lock (m_SendLock) m_SendQueue.Enqueue(new RemoteFrame(kind, requestId, payload));
             try { m_SendSignal.Release(); } catch (ObjectDisposedException) { }
-        }
-
-        private void EnsureBundle()
-        {
-            if (m_IncomingBundle == null) throw new InvalidDataException("No active bundle.");
         }
 
         private static string GetRuntimeTarget()
@@ -410,32 +554,30 @@ namespace HybridCLR.RemoteExecution
 #endif
         }
 
-        private sealed class IncomingBundle
+        private sealed class IncomingCommandInput
         {
-            internal IncomingBundle(RemoteBundleManifest manifest, Guid requestId)
-            {
-                Manifest = manifest;
-                RequestId = requestId;
-                Assemblies = new IncomingAssembly[manifest.Assemblies.Length];
-                for (int i = 0; i < Assemblies.Length; i++) Assemblies[i] = new IncomingAssembly();
-            }
-            internal RemoteBundleManifest Manifest { get; }
-            internal Guid RequestId { get; }
-            internal IncomingAssembly[] Assemblies { get; }
-            internal bool IsComplete()
-            {
-                foreach (IncomingAssembly assembly in Assemblies)
-                    if (!assembly.DllComplete || (assembly.Pdb != null && !assembly.PdbComplete)) return false;
-                return true;
-            }
-        }
+            private IncomingCommandInput() { }
 
-        private sealed class IncomingAssembly
-        {
-            internal MemoryStream Dll;
-            internal MemoryStream Pdb;
-            internal bool DllComplete;
-            internal bool PdbComplete;
+            internal Guid RequestId { get; private set; }
+            internal string CommandId { get; private set; }
+            internal string ContentType { get; private set; }
+            internal long Length { get; private set; }
+            internal byte[] Hash { get; private set; }
+            internal MemoryStream CommandPayload { get; private set; }
+
+            internal static IncomingCommandInput Create(Guid requestId, string commandId,
+                string contentType, long length, byte[] hash)
+            {
+                return new IncomingCommandInput
+                {
+                    RequestId = requestId,
+                    CommandId = commandId,
+                    ContentType = contentType,
+                    Length = length,
+                    Hash = hash,
+                    CommandPayload = new MemoryStream(checked((int)length))
+                };
+            }
         }
     }
 

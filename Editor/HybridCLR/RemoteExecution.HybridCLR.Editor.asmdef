@@ -1,0 +1,29 @@
+{
+  "name": "RemoteExecution.HybridCLR.Editor",
+  "rootNamespace": "RemoteExecution.HybridCLR",
+  "references": [
+    "RemoteExecution.Editor",
+    "RemoteExecution.Runtime",
+    "RemoteExecution.HybridCLR.Runtime",
+    "HybridCLR.Editor"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "versionDefines": [
+    {
+      "name": "com.code-philosophy.hybridclr",
+      "expression": "1.0",
+      "define": "REMOTE_EXECUTION_HYBRIDCLR"
+    }
+  ],
+  "defineConstraints": [
+    "REMOTE_EXECUTION_HYBRIDCLR"
+  ],
+  "noEngineReferences": false
+}

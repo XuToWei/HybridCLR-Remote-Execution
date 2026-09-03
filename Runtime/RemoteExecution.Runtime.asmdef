@@ -1,7 +1,7 @@
 {
-  "name": "HybridCLR.RemoteExecution.Runtime",
-  "rootNamespace": "HybridCLR.RemoteExecution",
-  "references": ["HybridCLR.Runtime"],
+  "name": "RemoteExecution.Runtime",
+  "rootNamespace": "RemoteExecution",
+  "references": [],
   "includePlatforms": [],
   "excludePlatforms": [],
   "allowUnsafeCode": false,
