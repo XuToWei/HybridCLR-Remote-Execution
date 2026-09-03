@@ -10,19 +10,23 @@ namespace RemoteExecution.HybridCLR
     internal sealed class HybridCLRRemoteExecutionPanel : IRemoteExecutionEditorPanel
     {
         private static readonly SemaphoreSlim s_BuildLock = new SemaphoreSlim(1, 1);
-        private Vector2 m_SourceScroll;
-        private string m_Source = @"using RemoteExecution;
+        private const string DefaultSource = @"using System.Threading;
+using System.Threading.Tasks;
+using RemoteExecution.HybridCLR;
+using UnityEngine;
 
-public static class RemoteCommand
+public sealed class RemoteExecutionEntry : IHybridCLRRemoteExecutionEntry
 {
-    [RemoteCommand(""Run custom command"")]
-    public static void Execute()
+    public Task ExecuteAsync(CancellationToken cancellationToken)
     {
-        UnityEngine.Debug.Log(""Remote command executed."");
+        cancellationToken.ThrowIfCancellationRequested();
+
+        Debug.Log(""Remote execution entry completed."");
+        return Task.CompletedTask;
     }
 }";
-        private string m_EntryTypeName = "RemoteCommand";
-        private string m_EntryMethodName = "Execute";
+        private Vector2 m_SourceScroll;
+        private string m_Source = DefaultSource;
         public string Id => "remote-execution.hybridclr";
         public string DisplayName => "HybridCLR";
         public int Order => 100;
@@ -49,15 +53,13 @@ public static class RemoteCommand
             if (capabilityProblem != null)
                 EditorGUILayout.HelpBox(capabilityProblem, MessageType.Info);
             EditorGUILayout.HelpBox(
-                "Loaded assemblies cannot be unloaded. A different build of the same assembly or a partial load requires restarting the Player.",
+                "Source must contain exactly one public IHybridCLRRemoteExecutionEntry implementation with a public parameterless constructor. Loaded assemblies cannot be unloaded; a different build of the same assembly or a partial load requires restarting the Player.",
                 MessageType.Warning);
         }
 
         private void DrawSource()
         {
-            EditorGUILayout.LabelField("Dynamic Entry", EditorStyles.boldLabel);
-            m_EntryTypeName = EditorGUILayout.TextField("Entry Type FullName", m_EntryTypeName);
-            m_EntryMethodName = EditorGUILayout.TextField("Entry Method", m_EntryMethodName);
+            EditorGUILayout.LabelField("Source Code", EditorStyles.boldLabel);
             m_SourceScroll = EditorGUILayout.BeginScrollView(m_SourceScroll,
                 GUILayout.MinHeight(180), GUILayout.MaxHeight(360));
             m_Source = EditorGUILayout.TextArea(m_Source, GUILayout.ExpandHeight(true));
@@ -86,11 +88,7 @@ public static class RemoteCommand
             RemoteExecutionClientInfo player)
         {
             int sessionId = player.Id;
-            var request = new HybridCLRRemoteBuildRequest(
-                player.Target,
-                m_Source,
-                m_EntryTypeName,
-                m_EntryMethodName);
+            var request = new HybridCLRRemoteBuildRequest(player.Target, m_Source);
             context.TryStartOperation("Compiling, applying and executing...",
                 token => RunAsync(sessionId, request, token));
         }
@@ -115,33 +113,19 @@ public static class RemoteCommand
             finally { s_BuildLock.Release(); }
 
             cancellationToken.ThrowIfCancellationRequested();
-            byte[] envelope = HybridCLRBundleCodec.Encode(new HybridCLRBundle(Guid.NewGuid(),
-                output.Target, output.EntryCommandId, output.Artifacts));
+            byte[] envelope = HybridCLRBundleCodec.Encode(new HybridCLRBundle(
+                Guid.NewGuid(), output.Target, output.Artifacts));
             if (envelope.Length > applyCommand.MaxRequestBytes)
                 throw new InvalidOperationException(
                     $"HybridCLR bundle exceeds the Player limit of {applyCommand.MaxRequestBytes} bytes.");
-            RemoteExecutionResult applied = await RemoteExecutionEditorApi.ExecuteCommandAsync(
+            RemoteExecutionResult result = await RemoteExecutionEditorApi.ExecuteCommandAsync(
                 sessionId, HybridCLRBundleCodec.ApplyCommandId, envelope,
                 HybridCLRBundleCodec.ContentType, cancellationToken);
-            if (!applied.Succeeded)
+            if (!result.Succeeded)
                 throw new InvalidOperationException(
-                    $"Player load failed [{applied.Code}]: {applied.Message}");
-
-            await RemoteExecutionEditorApi.RefreshCommandsAsync(sessionId, cancellationToken);
-            client = FindReadyClient(sessionId);
-            RemoteCommandSnapshot entry = client.Commands.FirstOrDefault(command =>
-                string.Equals(command.Id, output.EntryCommandId, StringComparison.Ordinal));
-            if (entry == null || !entry.Executable || entry.MaxRequestBytes != 0)
-                throw new InvalidOperationException(
-                    $"Expected zero-payload entry command was not published: {output.EntryCommandId}");
-            RemoteExecutionResult invoked = await RemoteExecutionEditorApi.ExecuteCommandAsync(
-                sessionId, entry.Id, Array.Empty<byte>(), entry.RequestContentType,
-                cancellationToken);
-            if (!invoked.Succeeded)
-                throw new InvalidOperationException(
-                    $"Player execution failed [{invoked.Code}]: {invoked.Message}");
-            return string.IsNullOrWhiteSpace(invoked.Message)
-                ? "Compile, apply and execution completed." : invoked.Message;
+                    $"Player apply or execution failed [{result.Code}]: {result.Message}");
+            return string.IsNullOrWhiteSpace(result.Message)
+                ? "Compile, apply and execution completed." : result.Message;
         }
 
         private static RemoteExecutionClientInfo FindReadyClient(int sessionId)

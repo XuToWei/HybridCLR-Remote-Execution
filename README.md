@@ -1,41 +1,85 @@
 # Unity Remote Execution
 
+English · [简体中文](README.zh-CN.md)
+
 Unity Remote Execution is a TCP bridge between the Unity Editor and a Player, intended for development workflows. Business code registers named commands, the Editor displays each Player's command catalog, and Editor tools can send bounded binary requests and receive bounded binary results.
 
 The core package has no HybridCLR dependency. HybridCLR compilation and runtime assembly loading are a conditional adapter implemented with the same generic command API.
 
-## Setup
+## Installation
 
-1. Add this package to a Unity 2021.3 or newer project.
-2. Create **Create > Unity > Remote Execution Settings**.
-3. Add `RemoteExecutionComponent` to a boot scene and assign the settings asset.
-4. Configure the Editor host and port in the asset, and the matching bind address and port in **Window > Remote Execution**.
-5. Start the server, then launch the Player.
+In a Unity 2021.3 or newer project, open **Window > Package Manager**, click **+**, select **Add package from git URL...**, and paste:
 
-The component disables itself in the Editor, but the package does not restrict which Player build types may connect. Both the Editor bind address and Player host default to `127.0.0.1`. For LAN use, bind the Editor to a reachable local interface (or `0.0.0.0`), configure the Player with the Editor machine's actual LAN address, and allow the port through the firewall. `0.0.0.0` is a bind address, not a valid Player destination.
+```text
+https://github.com/XuToWei/UnityRemoteExecution.git
+```
+
+## Player startup
+
+The package does not add anything to a scene and does not connect automatically. Start and stop the Player client from your own bootstrap or development UI:
+
+```csharp
+using RemoteExecution;
+using UnityEngine;
+
+public sealed class RemoteExecutionControls : MonoBehaviour
+{
+    private void OnEnable()
+    {
+        RemoteExecutionPlayerApi.ConnectionStateChanged += OnConnectionStateChanged;
+    }
+
+    private void OnDisable()
+    {
+        RemoteExecutionPlayerApi.ConnectionStateChanged -= OnConnectionStateChanged;
+    }
+
+    public void Connect()
+    {
+        RemoteExecutionPlayerApi.Start("192.168.1.20", 38421, "Test Device");
+    }
+
+    public void Disconnect()
+    {
+        RemoteExecutionPlayerApi.Stop();
+    }
+
+    private static void OnConnectionStateChanged(RemoteExecutionConnectionState state)
+    {
+        Debug.Log($"Remote Execution: {state}");
+        if (state == RemoteExecutionConnectionState.Faulted)
+        {
+            RemoteExecutionConnectionError error = RemoteExecutionPlayerApi.LastError;
+            Debug.LogWarning($"[{error.Code}] {error.Message}");
+        }
+    }
+}
+```
+
+`ConnectionState` reports `Disconnected`, `Connecting`, `Handshaking`, `Connected`, or `Faulted`; `IsConnected` is true only after the Editor acknowledges the protocol handshake. State-change callbacks run on Unity's main thread. `LastError` contains a stable code and message while faulted.
+
+`Start` validates the host, port, client ID, and optional transfer limits synchronously. Calling it again with the same parameters while active does nothing; calling it after a fault retries, and calling it with different parameters replaces the current connection. There is no automatic reconnect, so the business layer controls retry timing and UI. `Stop` is safe to call repeatedly.
+
+The Player API is unavailable in Editor Play Mode. Start the Editor listener from **Window > Remote Execution**, then call `RemoteExecutionPlayerApi.Start` from a built Player. No `RemoteExecutionComponent` or settings asset is required.
+
+The package does not restrict which Player build types may connect. The Editor bind address defaults to `127.0.0.1`, and `Start` commonly uses the same host for local connections. For LAN use, bind the Editor to a reachable local interface (or `0.0.0.0`), pass the Editor machine's actual LAN address to the Player, and allow the port through the firewall. `0.0.0.0` is a bind address, not a valid Player destination.
 
 There is no authentication or encryption. Any host that can reach the listener can identify itself arbitrarily and execute exposed commands. Use this bridge only on trusted development networks. The consuming project is responsible for excluding or disabling it in production builds when required.
 
 ## Runtime extension API
 
-Implement `IRemoteCommandProvider` in an ordinary C# class with a public parameterless constructor:
+Register each named binary handler explicitly before starting the Player connection:
 
 ```csharp
 using System.Threading;
 using System.Threading.Tasks;
 using RemoteExecution;
-using UnityEngine.Scripting;
 
-[Preserve]
-public sealed class TableRemoteCommands : IRemoteCommandProvider
+public static class TableRemoteCommands
 {
-    public TableRemoteCommands()
+    public static void Register()
     {
-    }
-
-    public void RegisterCommands(IRemoteCommandRegistry registry)
-    {
-        registry.Register(
+        RemoteCommandRegistry.Register(
             new RemoteCommandDefinition(
                 "table.reload",
                 "Reload tables",
@@ -45,40 +89,28 @@ public sealed class TableRemoteCommands : IRemoteCommandProvider
                 maxRequestBytes: 64 * 1024 * 1024,
                 maxResponseBytes: 1024,
                 requestContentType: "application/octet-stream",
-                responseContentType: "text/plain"),
+                responseContentType: "application/octet-stream"),
             async (context, cancellationToken) =>
             {
-                await ReloadTablesAsync(context.Payload, cancellationToken);
-                return RemoteCommandResult.Success("Tables reloaded.");
+                byte[] request = context.Payload;
+                byte[] response = await ReloadTablesAsync(request, cancellationToken);
+                return RemoteCommandResult.Success(
+                    "Tables reloaded.", response, "application/octet-stream");
             });
     }
 
-    private Task ReloadTablesAsync(byte[] data, CancellationToken cancellationToken)
+    private static Task<byte[]> ReloadTablesAsync(
+        byte[] data, CancellationToken cancellationToken)
     {
         // Validate the bytes and atomically replace the runtime table data.
-        return Task.CompletedTask;
+        return Task.FromResult(new byte[0]);
     }
 }
 ```
 
-Before connecting, the Player scans the types in all currently loaded assemblies. It constructs every concrete, closed, non-`UnityEngine.Object` implementation once, in deterministic assembly/type-name order. Constructors should be cheap and must not depend on scene-object injection.
+Call `TableRemoteCommands.Register()` once before `RemoteExecutionPlayerApi.Start(...)`. Command IDs must be globally unique; duplicate registration throws. Static methods are not exposed automatically, and the package has no command attribute.
 
-Because discovery and construction use reflection, IL2CPP projects should apply `[Preserve]` or preserve each provider and its public parameterless constructor in the consuming project's `Assets/link.xml`.
-
-For simple zero-payload commands, use `[RemoteCommand]` on a static parameterless method returning `void`, `Task`, or `UniTask`:
-
-```csharp
-using RemoteExecution;
-
-public static class DevelopmentCommands
-{
-    [RemoteCommand("Run a development check", timeoutSeconds: 30)]
-    public static void RunCheck()
-    {
-        UnityEngine.Debug.Log("Remote check completed.");
-    }
-}
-```
+Reusable modules may still implement `IRemoteCommandProvider`; the Player discovers concrete provider types when it first starts. Because provider discovery uses reflection, IL2CPP projects should preserve providers and their public parameterless constructors with `[Preserve]` or `Assets/link.xml`.
 
 ## Editor API
 
@@ -148,18 +180,44 @@ The cancellation-aware `RefreshCommandsAsync` and `ExecuteCommandAsync` overload
 
 When `com.code-philosophy.hybridclr` is installed, the package's `versionDefines` activates the conditional adapter automatically. It adds a **HybridCLR** tool inside **Window > Remote Execution** and the Player command `hybridclr.apply-bundle`.
 
-The Remote Execution window is the only Editor entry point. Its **Basic** tab owns connection settings and the connected-Player overview. Its **Commands** tab owns Player/tool selection, per-Player operation state, status, and cancellation; the secondary tool switcher contains HybridCLR and other contributed panels rather than separate windows. Every user-facing remote action, including a simple zero-payload command, supplies its own `IRemoteExecutionEditorPanel`.
+The Remote Execution window is the only Editor entry point. Its **Basic** tab owns connection settings and the connected-Player overview. Its **Commands** tab owns Player/tool selection, per-Player operation state, status, and cancellation; the secondary tool switcher contains HybridCLR and other contributed panels rather than separate windows. Every user-facing remote action supplies its own `IRemoteExecutionEditorPanel`.
 
 The HybridCLR panel provides:
 
-- dynamic `[RemoteCommand]` source compilation into `RemoteExecution.Dynamic`;
-- validated DLL/PDB loading followed by command-catalog refresh and entry execution.
+- dynamic `IHybridCLRRemoteExecutionEntry` source compilation into `RemoteExecution.Dynamic`;
+- validated DLL/PDB loading followed by interface-entry execution.
+
+Dynamic source example:
+
+```csharp
+using System.Threading;
+using System.Threading.Tasks;
+using RemoteExecution.HybridCLR;
+
+public sealed class RemoteExecutionEntry : IHybridCLRRemoteExecutionEntry
+{
+    public async Task ExecuteAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // Handle application work after the assembly has loaded.
+        await ReloadGameLogicAsync(cancellationToken);
+    }
+
+    private static Task ReloadGameLogicAsync(CancellationToken cancellationToken)
+    {
+        return Task.CompletedTask;
+    }
+}
+```
+
+The entry must be a public concrete class with a public parameterless constructor, and a bundle must contain exactly one `IHybridCLRRemoteExecutionEntry` implementation. Exceptions from `ExecuteAsync` are returned to the Editor as `ENTRY_EXECUTION_FAILED`; cancellation uses the normal remote-command cancellation or timeout result.
 
 The panel does not compile or send project hot-update assemblies. Any assemblies referenced by the dynamic source must already be loaded in the Player.
 
-HybridCLR loading is not a core protocol feature. The Editor serializes a versioned HybridCLR-owned envelope and sends it through ordinary generic command input frames. The Player adapter validates the entire envelope and its per-artifact hashes before loading. After all loads succeed, it atomically publishes `[RemoteCommand]` methods from those assemblies. Projects remain responsible for their normal HybridCLR AOT metadata configuration.
+HybridCLR loading is not a core protocol feature. The Editor serializes a versioned HybridCLR-owned envelope and sends it through ordinary generic command input frames. The Player adapter validates the entire envelope and its per-artifact hashes before loading. A bundle must contain exactly one public concrete `IHybridCLRRemoteExecutionEntry` implementation with a public parameterless constructor. After loading, the adapter invokes `Task ExecuteAsync(CancellationToken)` inside the fixed `hybridclr.apply-bundle` request. The dynamic entry is not published in the command catalog. Projects remain responsible for their normal HybridCLR AOT metadata configuration.
 
-The complete envelope, including metadata, is limited to 128 MiB and is buffered in memory. Assemblies cannot be unloaded from the Player AppDomain. Reapplying the same name with a different hash, or a failure after loading begins, requires restarting the Player. A partial load is contained by withholding command registration and rejecting further apply attempts, but it cannot be rolled back.
+The complete envelope, including metadata, is limited to 128 MiB and is buffered in memory. Assemblies cannot be unloaded from the Player AppDomain. Reapplying the same name with a different hash, or a failure while loading or resolving the entry, requires restarting the Player. A partial load cannot be rolled back; the adapter rejects later apply attempts to avoid expanding an inconsistent state.
 
 Without HybridCLR, the adapter command and HybridCLR panel are absent. The Commands tab then shows panels contributed by other modules, or an empty state when none are installed.
 
@@ -167,6 +225,7 @@ Without HybridCLR, the adapter command and HybridCLR panel are absent. The Comma
 
 - Unity 2021.3 or newer.
 - The package does not enforce a Development/Debug Player requirement; consuming projects control build inclusion and production enablement.
+- The Player never starts or reconnects automatically; business code owns `Start`, retry, and `Stop`.
 - Maximum frame payload: 1 MiB.
 - Maximum transfer chunk: 60 KiB.
 - Hard command request limit: 128 MiB; default business-command request limit: 16 MiB.
@@ -184,18 +243,4 @@ Without HybridCLR, the adapter command and HybridCLR panel are absent. The Comma
 
 Protocol version 3 uses the `URX3` frame magic and an unauthenticated `Hello(requestId) → Ready(same requestId)` handshake. `Ready` must have an empty payload. Message numbers are explicit: `Hello=1`, `Ready=2`, `Error=3`, `Ping=4`, `Pong=5`, `ListCommands=6`, `Commands=7`, command-input begin/chunk/end `=8..10`, command-result metadata/chunk/end `=11..13`, and `CancelCommand=14`.
 
-Version 3 contains command-catalog discovery, generic command request/result transfer, cancellation, errors, and ping/pong. It has no v2 authentication fallback; v2 and v3 Editor/Player builds are not wire-compatible. The HybridCLR `HCB1` envelope version is independent and unchanged.
-
-## Migration
-
-This release intentionally uses the `RemoteExecution` namespace and package identity without compatibility shims:
-
-| Former API | Current API |
-| --- | --- |
-| `HybridCLR.RemoteExecution` | `RemoteExecution` |
-| `RemoteCallableAttribute` | `RemoteCommandAttribute` |
-| `RemoteCallableRegistry` | `RemoteCommandRegistry` |
-| **Window > HybridCLR > Remote Execution** | **Window > Remote Execution** |
-| `com.xw.hybridclr.remote-execution` | `com.xw.remote-execution` |
-
-`IRemoteAssemblyBundleLoader`, `RemoteExecutionRuntime`, the generic Editor build-provider API, and assembly-specific protocol frames have been removed. Update namespaces, asmdef references, scene components, settings assets, and custom Editor integrations directly.
+Version 3 contains command-catalog discovery, generic command request/result transfer, cancellation, errors, and ping/pong. It has no v2 authentication fallback; v2 and v3 Editor/Player builds are not wire-compatible. The HybridCLR `HCB1` envelope version 2 is independent from the core protocol.

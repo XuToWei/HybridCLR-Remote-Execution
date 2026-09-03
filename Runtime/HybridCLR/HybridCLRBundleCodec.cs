@@ -22,18 +22,16 @@ namespace RemoteExecution.HybridCLR
 
     public sealed class HybridCLRBundle
     {
-        public HybridCLRBundle(Guid bundleId, string target, string entryCommandId,
+        public HybridCLRBundle(Guid bundleId, string target,
             IReadOnlyList<HybridCLRBundleArtifact> artifacts)
         {
             BundleId = bundleId;
             Target = target ?? throw new ArgumentNullException(nameof(target));
-            EntryCommandId = entryCommandId ?? throw new ArgumentNullException(nameof(entryCommandId));
             Artifacts = artifacts ?? throw new ArgumentNullException(nameof(artifacts));
         }
 
         public Guid BundleId { get; }
         public string Target { get; }
-        public string EntryCommandId { get; }
         public IReadOnlyList<HybridCLRBundleArtifact> Artifacts { get; }
     }
 
@@ -44,7 +42,7 @@ namespace RemoteExecution.HybridCLR
         public const int MaxEnvelopeBytes = RemoteExecutionProtocol.MaxCommandRequestBytes;
         public const int MaxAssemblyCount = 256;
         private const uint Magic = 0x31424348; // HCB1 in little-endian form.
-        private const ushort Version = 1;
+        private const ushort Version = 2;
         private const ushort Flags = 0;
         private const int MaxStringBytes = 32 * 1024;
         private static readonly UTF8Encoding s_Utf8 = new UTF8Encoding(false, true);
@@ -60,7 +58,6 @@ namespace RemoteExecution.HybridCLR
                 writer.Write(Flags);
                 writer.Write(bundle.BundleId.ToByteArray());
                 WriteString(writer, bundle.Target);
-                WriteString(writer, bundle.EntryCommandId);
                 writer.Write((ushort)bundle.Artifacts.Count);
                 foreach (HybridCLRBundleArtifact artifact in bundle.Artifacts)
                 {
@@ -105,7 +102,6 @@ namespace RemoteExecution.HybridCLR
                 byte[] id = ReadExactly(reader, 16);
                 Guid bundleId = new Guid(id);
                 string target = ReadString(reader);
-                string entryCommandId = ReadString(reader);
                 int count = reader.ReadUInt16();
                 if (count < 1 || count > MaxAssemblyCount) throw new InvalidDataException("Invalid HybridCLR assembly count.");
                 var names = new HashSet<string>(StringComparer.Ordinal);
@@ -135,7 +131,7 @@ namespace RemoteExecution.HybridCLR
                     artifacts.Add(new HybridCLRBundleArtifact(name, dll, pdb));
                 }
                 if (stream.Position != stream.Length) throw new InvalidDataException("Unexpected trailing HybridCLR bundle bytes.");
-                var bundle = new HybridCLRBundle(bundleId, target, entryCommandId, artifacts);
+                var bundle = new HybridCLRBundle(bundleId, target, artifacts);
                 ValidateBundle(bundle);
                 return bundle;
             }
@@ -145,7 +141,6 @@ namespace RemoteExecution.HybridCLR
         {
             if (bundle == null) throw new ArgumentNullException(nameof(bundle));
             if (string.IsNullOrWhiteSpace(bundle.Target)) throw new InvalidDataException("HybridCLR target is required.");
-            if (string.IsNullOrWhiteSpace(bundle.EntryCommandId)) throw new InvalidDataException("HybridCLR entry command is required.");
             if (bundle.Artifacts == null || bundle.Artifacts.Count < 1 || bundle.Artifacts.Count > MaxAssemblyCount)
                 throw new InvalidDataException($"HybridCLR bundle must contain 1..{MaxAssemblyCount} assemblies.");
             var names = new HashSet<string>(StringComparer.Ordinal);
@@ -157,7 +152,6 @@ namespace RemoteExecution.HybridCLR
                 ValidateString(artifact.Name);
             }
             ValidateString(bundle.Target);
-            ValidateString(bundle.EntryCommandId);
         }
 
         private static void WriteString(BinaryWriter writer, string value)

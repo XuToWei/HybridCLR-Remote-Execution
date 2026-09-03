@@ -1,6 +1,6 @@
 {
   "name": "com.xw.remote-execution",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "displayName": "Unity Remote Execution",
   "description": "Unity Editor to Player remote command and binary transfer bridge for development workflows.",
   "unity": "2021.3",

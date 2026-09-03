@@ -1,41 +1,85 @@
 # Unity Remote Execution（简体中文）
 
+[English](README.md) · 简体中文
+
 Unity Remote Execution 是一个面向开发工作流的 Unity Editor 与 Player TCP 桥接。业务代码注册命令，Editor 显示每个 Player 的命令目录；Editor 工具可以发送有大小限制的二进制请求并接收二进制结果。
 
 核心包不依赖 HybridCLR。HybridCLR 编译和运行时程序集加载是条件启用的可选适配器，并且同样通过通用远程命令实现。
 
-## 配置
+## 安装
 
-1. 将包添加到 Unity 2021.3 或更高版本项目。
-2. 创建 **Create > Unity > Remote Execution Settings**。
-3. 在启动场景添加 `RemoteExecutionComponent` 并赋值配置资产。
-4. 在配置资产中填写 Editor 主机和端口，并在 **Window > Remote Execution** 中填写对应的监听地址和端口。
-5. 启动服务器，然后运行 Player。
+在 Unity 2021.3 或更高版本项目中打开 **Window > Package Manager**，点击左上角的 **+**，选择 **Add package from git URL...**，粘贴以下地址：
 
-组件在 Editor 中自动禁用，但包本身不限制可连接的 Player 构建类型。Editor 监听地址和 Player 主机均默认使用 `127.0.0.1`。局域网使用时，应让 Editor 监听可达的本机接口（也可监听 `0.0.0.0`），让 Player 填写 Editor 机器的实际局域网地址，并按需放行防火墙端口。`0.0.0.0` 只能用于监听，不能作为 Player 的目标地址。
+```text
+https://github.com/XuToWei/UnityRemoteExecution.git
+```
+
+## Player 启动
+
+包不会向场景添加组件，也不会自动连接。由业务层在自己的启动流程或开发 UI 中启动和停止 Player 客户端：
+
+```csharp
+using RemoteExecution;
+using UnityEngine;
+
+public sealed class RemoteExecutionControls : MonoBehaviour
+{
+    private void OnEnable()
+    {
+        RemoteExecutionPlayerApi.ConnectionStateChanged += OnConnectionStateChanged;
+    }
+
+    private void OnDisable()
+    {
+        RemoteExecutionPlayerApi.ConnectionStateChanged -= OnConnectionStateChanged;
+    }
+
+    public void Connect()
+    {
+        RemoteExecutionPlayerApi.Start("192.168.1.20", 38421, "Test Device");
+    }
+
+    public void Disconnect()
+    {
+        RemoteExecutionPlayerApi.Stop();
+    }
+
+    private static void OnConnectionStateChanged(RemoteExecutionConnectionState state)
+    {
+        Debug.Log($"Remote Execution: {state}");
+        if (state == RemoteExecutionConnectionState.Faulted)
+        {
+            RemoteExecutionConnectionError error = RemoteExecutionPlayerApi.LastError;
+            Debug.LogWarning($"[{error.Code}] {error.Message}");
+        }
+    }
+}
+```
+
+`ConnectionState` 会返回 `Disconnected`、`Connecting`、`Handshaking`、`Connected` 或 `Faulted`；只有 Editor 完成协议握手后，`IsConnected` 才为 `true`。状态回调在 Unity 主线程触发。发生故障时，`LastError` 提供稳定的错误码和消息。
+
+`Start` 会同步校验主机、端口、客户端 ID 和可选传输限制。连接期间使用相同参数重复调用不会产生新连接；故障后再次调用会重试，传入不同参数则替换当前连接。包不会自动重连，重试时机和 UI 完全由业务层控制。`Stop` 可以安全地重复调用。
+
+Player API 不支持 Editor Play Mode。先在 **Window > Remote Execution** 中启动 Editor 监听服务，再由构建后的 Player 调用 `RemoteExecutionPlayerApi.Start`。不需要添加 `RemoteExecutionComponent` 或创建配置资产。
+
+包本身不限制可连接的 Player 构建类型。Editor 监听地址默认使用 `127.0.0.1`，本机连接时 `Start` 通常也传入该地址。局域网使用时，应让 Editor 监听可达的本机接口（也可监听 `0.0.0.0`），向 Player 传入 Editor 机器的实际局域网地址，并按需放行防火墙端口。`0.0.0.0` 只能用于监听，不能作为 Player 的目标地址。
 
 连接没有认证或加密。任何能访问监听端口的主机都可以任意声明身份并执行已暴露的命令。只能在可信开发网络中使用；是否从生产构建中排除或禁用该功能，由接入项目自行负责。
 
 ## Runtime 扩展接口
 
-业务层在提供 public 无参构造函数的普通 C# 类中实现 `IRemoteCommandProvider`：
+在启动 Player 连接前，显式注册每个具名二进制 handler：
 
 ```csharp
 using System.Threading;
 using System.Threading.Tasks;
 using RemoteExecution;
-using UnityEngine.Scripting;
 
-[Preserve]
-public sealed class TableRemoteCommands : IRemoteCommandProvider
+public static class TableRemoteCommands
 {
-    public TableRemoteCommands()
+    public static void Register()
     {
-    }
-
-    public void RegisterCommands(IRemoteCommandRegistry registry)
-    {
-        registry.Register(
+        RemoteCommandRegistry.Register(
             new RemoteCommandDefinition(
                 "table.reload",
                 "Reload tables",
@@ -45,40 +89,28 @@ public sealed class TableRemoteCommands : IRemoteCommandProvider
                 maxRequestBytes: 64 * 1024 * 1024,
                 maxResponseBytes: 1024,
                 requestContentType: "application/octet-stream",
-                responseContentType: "text/plain"),
+                responseContentType: "application/octet-stream"),
             async (context, cancellationToken) =>
             {
-                await ReloadTablesAsync(context.Payload, cancellationToken);
-                return RemoteCommandResult.Success("Tables reloaded.");
+                byte[] request = context.Payload;
+                byte[] response = await ReloadTablesAsync(request, cancellationToken);
+                return RemoteCommandResult.Success(
+                    "Tables reloaded.", response, "application/octet-stream");
             });
     }
 
-    private Task ReloadTablesAsync(byte[] data, CancellationToken cancellationToken)
+    private static Task<byte[]> ReloadTablesAsync(
+        byte[] data, CancellationToken cancellationToken)
     {
         // 校验 bytes，并以原子方式替换运行时表格数据。
-        return Task.CompletedTask;
+        return Task.FromResult(new byte[0]);
     }
 }
 ```
 
-Player 建立连接前扫描当前已加载程序集中的类型。每个 Provider 必须是非抽象、非开放泛型、非 `UnityEngine.Object` 派生的普通类；Player 按程序集名和类型全名稳定排序，每种类型只创建一次。构造函数应保持轻量，不能依赖场景对象注入。
+在 `RemoteExecutionPlayerApi.Start(...)` 之前调用一次 `TableRemoteCommands.Register()`。命令 ID 必须全局唯一；重复注册会抛出异常。静态方法不会被自动暴露，包也不再提供命令特性。
 
-Provider 通过反射发现和构造。IL2CPP 项目应添加 `[Preserve]`，或在业务工程的 `Assets/link.xml` 中保留 Provider 和 public 无参构造函数。
-
-简单的零 payload 命令可以使用 static `[RemoteCommand]`；方法必须无参数，返回 `void`、`Task` 或 `UniTask`：
-
-```csharp
-using RemoteExecution;
-
-public static class DevelopmentCommands
-{
-    [RemoteCommand("执行开发环境检查", timeoutSeconds: 30)]
-    public static void RunCheck()
-    {
-        UnityEngine.Debug.Log("Remote check completed.");
-    }
-}
-```
+可复用模块仍可实现 `IRemoteCommandProvider`；Player 首次启动时会发现具体 Provider 类型。Provider 发现使用反射，因此 IL2CPP 项目应通过 `[Preserve]` 或 `Assets/link.xml` 保留 Provider 及其 public 无参构造函数。
 
 ## Editor API
 
@@ -145,18 +177,44 @@ Panel 必须是提供无参构造的 concrete 普通 C# 类，稳定 `Id` 必须
 
 安装 `com.code-philosophy.hybridclr` 后，包内 `versionDefines` 会自动启用条件适配器。它会在 **Window > Remote Execution** 内增加 **HybridCLR** 工具，并在 Player 注册 `hybridclr.apply-bundle`。
 
-Remote Execution 窗口是唯一 Editor 入口：**基础**页签管理连接配置和 Player 概览；**命令**页签统一管理 Player/工具选择、每个 Player 的任务状态、结果和取消。命令页的二级工具切换栏包含 HybridCLR 与其他业务 panel，不再创建独立窗口。每个面向用户的远程操作，包括简单的零 payload 命令，也由自身的 `IRemoteExecutionEditorPanel` 提供界面。
+Remote Execution 窗口是唯一 Editor 入口：**基础**页签管理连接配置和 Player 概览；**命令**页签统一管理 Player/工具选择、每个 Player 的任务状态、结果和取消。命令页的二级工具切换栏包含 HybridCLR 与其他业务 panel，不再创建独立窗口。每个面向用户的远程操作由自身的 `IRemoteExecutionEditorPanel` 提供界面。
 
 HybridCLR panel 提供：
 
-- 将动态 `[RemoteCommand]` 源码编译到 `RemoteExecution.Dynamic`；
-- DLL/PDB 校验加载、目录刷新和入口执行。
+- 将动态 `IHybridCLRRemoteExecutionEntry` 源码编译到 `RemoteExecution.Dynamic`；
+- DLL/PDB 校验加载和接口入口执行。
+
+动态源码示例：
+
+```csharp
+using System.Threading;
+using System.Threading.Tasks;
+using RemoteExecution.HybridCLR;
+
+public sealed class RemoteExecutionEntry : IHybridCLRRemoteExecutionEntry
+{
+    public async Task ExecuteAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // 在这里处理程序集加载完成后的业务逻辑。
+        await ReloadGameLogicAsync(cancellationToken);
+    }
+
+    private static Task ReloadGameLogicAsync(CancellationToken cancellationToken)
+    {
+        return Task.CompletedTask;
+    }
+}
+```
+
+入口必须是 public concrete class，提供 public 无参构造函数，并且一个 bundle 中只能存在一个 `IHybridCLRRemoteExecutionEntry` 实现。`ExecuteAsync` 的异常会作为 `ENTRY_EXECUTION_FAILED` 返回 Editor；取消会沿用远程命令的取消或超时结果。
 
 该 panel 不会编译或发送项目中的热更新程序集。动态源码引用的程序集必须已在 Player 中加载。
 
-HybridCLR 加载不是核心协议特性。Editor 把自有的版本化 HybridCLR envelope 通过普通通用命令输入帧发送。Player 在加载前完整校验 envelope 和每个 artifact 的 hash；全部加载成功后，才原子发布新程序集中的 `[RemoteCommand]`。项目仍需自行完成正常的 HybridCLR AOT metadata 配置。
+HybridCLR 加载不是核心协议特性。Editor 把自有的版本化 HybridCLR envelope 通过普通通用命令输入帧发送。Player 在加载前完整校验 envelope 和每个 artifact 的 hash。Bundle 必须包含且仅包含一个 public concrete `IHybridCLRRemoteExecutionEntry` 实现，并提供 public 无参构造函数。加载后，适配器会在固定的 `hybridclr.apply-bundle` 请求内调用 `Task ExecuteAsync(CancellationToken)`；动态入口不会发布到命令目录。项目仍需自行完成正常的 HybridCLR AOT metadata 配置。
 
-完整 envelope（含 metadata）最大 128 MiB，并会完整缓冲在内存中。程序集不能从 Player AppDomain 卸载。同名程序集 hash 变化，或加载开始后发生失败，都必须重启 Player。部分加载无法回滚；适配器会阻止发布本批命令并拒绝后续 apply，避免继续扩大不一致状态。
+完整 envelope（含 metadata）最大 128 MiB，并会完整缓冲在内存中。程序集不能从 Player AppDomain 卸载。同名程序集 hash 变化，或加载、解析入口过程中发生失败，都必须重启 Player。部分加载无法回滚；适配器会拒绝后续 apply，避免继续扩大不一致状态。
 
 未安装 HybridCLR 时，该命令和 HybridCLR panel 都不存在。命令页仍显示其他模块提供的 panel；若没有任何实现，则显示空状态。
 
@@ -164,6 +222,7 @@ HybridCLR 加载不是核心协议特性。Editor 把自有的版本化 HybridCL
 
 - Unity 2021.3 或更高版本。
 - 包本身不强制要求 Development/Debug Player；构建包含范围和生产环境启用策略由接入项目控制。
+- Player 不会自动启动或重连；业务代码负责 `Start`、重试和 `Stop`。
 - 单帧 payload 最大 1 MiB。
 - 单分片最大 60 KiB。
 - command request 硬上限 128 MiB，普通业务命令默认 16 MiB。
@@ -181,18 +240,4 @@ HybridCLR 加载不是核心协议特性。Editor 把自有的版本化 HybridCL
 
 协议版本 3 使用 `URX3` frame magic，以及无认证的 `Hello(requestId) → Ready(same requestId)` 握手；`Ready` payload 必须为空。消息编号显式固定为：`Hello=1`、`Ready=2`、`Error=3`、`Ping=4`、`Pong=5`、`ListCommands=6`、`Commands=7`、command input begin/chunk/end 为 `8..10`、command result metadata/chunk/end 为 `11..13`、`CancelCommand=14`。
 
-版本 3 只包含命令目录、通用 command request/result、取消、错误和 ping/pong，不提供 v2 认证回退；v2 与 v3 的 Editor/Player 不兼容。HybridCLR 的 `HCB1` envelope 版本相互独立，本次保持不变。
-
-## 迁移
-
-本版本直接使用新的 `RemoteExecution` 命名空间和包名，不提供兼容 shim：
-
-| 旧 API | 当前 API |
-| --- | --- |
-| `HybridCLR.RemoteExecution` | `RemoteExecution` |
-| `RemoteCallableAttribute` | `RemoteCommandAttribute` |
-| `RemoteCallableRegistry` | `RemoteCommandRegistry` |
-| **Window > HybridCLR > Remote Execution** | **Window > Remote Execution** |
-| `com.xw.hybridclr.remote-execution` | `com.xw.remote-execution` |
-
-`IRemoteAssemblyBundleLoader`、`RemoteExecutionRuntime`、通用 Editor build-provider API 和程序集专用协议帧均已删除。请直接更新命名空间、asmdef 引用、场景组件、配置资产和自定义 Editor 集成。
+版本 3 只包含命令目录、通用 command request/result、取消、错误和 ping/pong，不提供 v2 认证回退；v2 与 v3 的 Editor/Player 不兼容。HybridCLR 的 `HCB1` envelope 版本 2 与核心协议相互独立。

@@ -13,37 +13,27 @@ namespace RemoteExecution.HybridCLR
 {
     internal sealed class HybridCLRRemoteBuildRequest
     {
-        internal HybridCLRRemoteBuildRequest(string target,
-            string source,
-            string entryTypeName,
-            string entryMethodName)
+        internal HybridCLRRemoteBuildRequest(string target, string source)
         {
             Target = target;
             Source = source;
-            EntryTypeName = entryTypeName;
-            EntryMethodName = entryMethodName;
         }
 
         internal string Target { get; }
         internal string Source { get; }
-        internal string EntryTypeName { get; }
-        internal string EntryMethodName { get; }
     }
 
     internal sealed class HybridCLRRemoteBuildOutput
     {
         internal HybridCLRRemoteBuildOutput(string target,
-            IReadOnlyList<HybridCLRBundleArtifact> artifacts,
-            string entryCommandId)
+            IReadOnlyList<HybridCLRBundleArtifact> artifacts)
         {
             Target = target;
             Artifacts = artifacts;
-            EntryCommandId = entryCommandId;
         }
 
         internal string Target { get; }
         internal IReadOnlyList<HybridCLRBundleArtifact> Artifacts { get; }
-        internal string EntryCommandId { get; }
     }
 
     internal static class HybridCLRRemoteExecutionCompiler
@@ -70,10 +60,8 @@ namespace RemoteExecution.HybridCLR
             HybridCLRBundleArtifact dynamicArtifact = await CompileDynamicSourceAsync(
                 target, outputDirectory, DynamicAssemblyName, request.Source, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
-            string entryCommandId =
-                $"{DynamicAssemblyName}::{request.EntryTypeName}::{request.EntryMethodName}";
             return new HybridCLRRemoteBuildOutput(request.Target,
-                new[] { dynamicArtifact }, entryCommandId);
+                new[] { dynamicArtifact });
         }
 
         private static void ValidateInput(HybridCLRRemoteBuildRequest request)
@@ -81,15 +69,6 @@ namespace RemoteExecution.HybridCLR
             if (string.IsNullOrWhiteSpace(request.Source)) throw new InvalidOperationException("Custom source code is required.");
             if (Encoding.UTF8.GetByteCount(request.Source) > MaxSourceBytes)
                 throw new InvalidOperationException($"Custom source code exceeds {MaxSourceBytes} bytes.");
-            if (request.Source.IndexOf("RemoteCommand", StringComparison.Ordinal) < 0)
-                throw new InvalidOperationException("Custom source must contain a RemoteCommand attribute on its entry method.");
-            if (string.IsNullOrWhiteSpace(request.EntryTypeName) ||
-                string.IsNullOrWhiteSpace(request.EntryMethodName))
-                throw new InvalidOperationException("Entry type and method are required.");
-            if (request.EntryTypeName.Contains("::") || request.EntryMethodName.Contains("::"))
-                throw new InvalidOperationException("Entry type and method must not contain '::'.");
-            if (request.EntryTypeName.Length > 1024 || request.EntryMethodName.Length > 1024)
-                throw new InvalidOperationException("Entry type and method are too long.");
             if (!Enum.TryParse(request.Target, true, out BuildTarget _))
                 throw new InvalidOperationException($"Unsupported Player target '{request.Target}'.");
         }
