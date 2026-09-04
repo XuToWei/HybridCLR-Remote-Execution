@@ -2,7 +2,7 @@
 
 [English](README.md) · 简体中文
 
-Unity Remote Execution 是一个面向开发工作流的 Unity Editor 与 Player TCP 桥接。业务代码注册命令，Editor 显示每个 Player 的命令目录；Editor 工具可以发送有大小限制的二进制请求并接收二进制结果。
+Unity Remote Execution 是一个面向开发工作流的 Unity Editor 与 Player 远程执行桥接。包内置 TCP，也支持业务层提供 WebSocket 或其他可靠有序传输。业务代码注册命令，Editor 显示每个 Player 的命令目录；Editor 工具可以发送有大小限制的二进制请求并接收二进制结果。
 
 核心包不依赖 HybridCLR。HybridCLR 编译和运行时程序集加载是条件启用的可选适配器，并且同样通过通用远程命令实现。
 
@@ -58,13 +58,34 @@ public sealed class RemoteExecutionControls : MonoBehaviour
 
 `ConnectionState` 会返回 `Disconnected`、`Connecting`、`Handshaking`、`Connected` 或 `Faulted`；只有 Editor 完成协议握手后，`IsConnected` 才为 `true`。状态回调在 Unity 主线程触发。发生故障时，`LastError` 提供稳定的错误码和消息。
 
-`Start` 会同步校验主机、端口、客户端 ID 和可选传输限制。连接期间使用相同参数重复调用不会产生新连接；故障后再次调用会重试，传入不同参数则替换当前连接。包不会自动重连，重试时机和 UI 完全由业务层控制。`Stop` 可以安全地重复调用。
+`Start` 会同步校验连接器、客户端 ID、超时和可选传输限制。使用 host/port overload 或未提供自定义连接器时，包会使用默认 TCP。连接期间使用相同参数重复调用不会产生新连接；故障后再次调用会重试，传入不同参数则替换当前连接。包不会自动重连，重试时机和 UI 完全由业务层控制。`Stop` 可以安全地重复调用。
 
 Player API 不支持 Editor Play Mode。先在 **Window > Remote Execution** 中启动 Editor 监听服务，再由构建后的 Player 调用 `RemoteExecutionPlayerApi.Start`。不需要添加 `RemoteExecutionComponent` 或创建配置资产。
 
 包本身不限制可连接的 Player 构建类型。Editor 监听地址默认使用 `127.0.0.1`，本机连接时 `Start` 通常也传入该地址。局域网使用时，应让 Editor 监听可达的本机接口（也可监听 `0.0.0.0`），向 Player 传入 Editor 机器的实际局域网地址，并按需放行防火墙端口。`0.0.0.0` 只能用于监听，不能作为 Player 的目标地址。
 
-连接没有认证或加密。任何能访问监听端口的主机都可以任意声明身份并执行已暴露的命令。只能在可信开发网络中使用；是否从生产构建中排除或禁用该功能，由接入项目自行负责。
+核心协议不认证 `ClientId`。默认 TCP 没有认证或加密；自定义传输可以提供 TLS 或认证，但业务层仍应自行定义信任策略。只能在可信开发环境中使用，并由接入项目负责生产构建的包含和启用策略。
+
+## 自定义传输
+
+默认情况下，Player 的 `Start(host, port, ...)` 和 Editor 窗口都使用 TCP。需要 WebSocket 或其他协议时，业务层分别实现 `IRemoteExecutionConnector`、`IRemoteExecutionListener` 和它们返回的 `IRemoteExecutionChannel`：
+
+```csharp
+// Player：connector 内部可以使用 WebSocket、IPC 或项目自己的网络库。
+var options = new RemoteExecutionPlayerOptions(
+    connector: new GameWebSocketConnector("wss://dev.example/remote"),
+    clientId: "Test Device");
+RemoteExecutionPlayerApi.Start(options);
+
+// Editor：安装与 Player 匹配的 listener。
+RemoteExecutionEditorApi.StartServer(
+    new RemoteExecutionServerOptions(
+        new GameWebSocketListener("wss://localhost:9443/remote")));
+```
+
+`IRemoteExecutionChannel` 传输完整的 `RemoteFrame`，必须保证可靠、无丢失且严格有序。包最多同时执行一次 send 和一次 receive；`Abort()` 必须立即解除等待中的 I/O，且与 `Dispose()` 一样可安全重复调用。connector 的 `ConnectionKey` 应稳定表示 URI、subprotocol、认证配置等所有连接参数，但不能包含 secret；相同 key 用于判断重复 `Start`。
+
+WebSocket 推荐将一个完整 URX3 frame 映射为一个 binary message：发送时使用 `RemoteExecutionProtocol.EncodeFrame`，接收完整消息后使用 `DecodeFrame`。WebSocket fragment 必须先重组，text message 必须拒绝。UDP 等无序协议若要接入，必须由实现层补齐排序、重传、去重和连接语义。
 
 ## Runtime 扩展接口
 
@@ -232,7 +253,7 @@ HybridCLR 加载不是核心协议特性。Editor 把自有的版本化 HybridCL
 - 每个 Player 同时只执行一个命令。
 - `requiresMainThread: true` 只保证 handler 从 Unity 主线程开始；异步 continuation 之后的线程由 handler 自行负责。
 - 超时和取消是协作式的；忽略取消的 handler 不能被安全强行中断。
-- 传输没有认证或加密；任何能访问监听端口的主机都可能调用已暴露的命令。
+- 核心协议不认证 `ClientId`；默认 TCP 没有认证或加密，自定义传输的 TLS/认证由其实现负责。
 - SHA-256 只能检测意外的传输损坏，不能认证对端，也不能抵御主动篡改。
 - 不要暴露破坏性操作或修改生产数据的 handler。
 

@@ -98,7 +98,7 @@ namespace RemoteExecution
             {
                 EditorGUILayout.LabelField("Unity Remote Execution", EditorStyles.boldLabel);
                 GUILayout.FlexibleSpace();
-                bool isRunning = RemoteExecutionServer.IsRunning;
+                bool isRunning = RemoteExecutionEditorApi.IsServerRunning;
                 var statusStyle = new GUIStyle(EditorStyles.miniLabel)
                 {
                     fontStyle = FontStyle.Bold
@@ -111,7 +111,7 @@ namespace RemoteExecution
                         ? new Color(1f, 0.48f, 0.43f)
                         : new Color(0.72f, 0.10f, 0.08f));
                 GUILayout.Label(isRunning
-                    ? $"Listening · {RemoteExecutionServer.Port}"
+                    ? $"Listening · {RemoteExecutionEditorApi.ListenerDescription}"
                     : "Stopped", statusStyle);
             }
         }
@@ -137,7 +137,7 @@ namespace RemoteExecution
             if (!string.IsNullOrEmpty(m_WindowStatus))
                 EditorGUILayout.HelpBox(m_WindowStatus, MessageType.Error);
             EditorGUILayout.HelpBox(
-                "No authentication or encryption. Any host that can reach this listener can execute exposed commands. Use only on trusted networks, and exclude or disable this feature in production builds as needed.",
+                "ClientId is self-reported by the core protocol. Bundled TCP has no authentication or encryption; a custom transport owns any TLS or authentication policy. Use only in trusted development environments.",
                 MessageType.Warning);
         }
 
@@ -205,7 +205,7 @@ namespace RemoteExecution
 
         private void DrawServerControls()
         {
-            using (new EditorGUI.DisabledScope(RemoteExecutionServer.IsRunning))
+            using (new EditorGUI.DisabledScope(RemoteExecutionEditorApi.IsServerRunning))
             {
                 m_Address = EditorGUILayout.TextField("Bind Address", m_Address);
                 using (new EditorGUILayout.HorizontalScope())
@@ -227,13 +227,13 @@ namespace RemoteExecution
             }
             using (new EditorGUILayout.HorizontalScope())
             {
-                using (new EditorGUI.DisabledScope(RemoteExecutionServer.IsRunning))
+                using (new EditorGUI.DisabledScope(RemoteExecutionEditorApi.IsServerRunning))
                 {
                     if (GUILayout.Button("Start"))
                     {
                         try
                         {
-                            RemoteExecutionServer.Start(m_Address, m_Port);
+                            RemoteExecutionEditorApi.StartServer(m_Address, m_Port);
                             m_WindowStatus = null;
                         }
                         catch (Exception exception)
@@ -242,12 +242,12 @@ namespace RemoteExecution
                         }
                     }
                 }
-                using (new EditorGUI.DisabledScope(!RemoteExecutionServer.IsRunning))
+                using (new EditorGUI.DisabledScope(!RemoteExecutionEditorApi.IsServerRunning))
                 {
                     if (GUILayout.Button("Stop"))
                     {
                         CancelAllOperations();
-                        RemoteExecutionServer.Stop();
+                        RemoteExecutionEditorApi.StopServer();
                     }
                 }
             }

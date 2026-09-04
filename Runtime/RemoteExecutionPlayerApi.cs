@@ -1,5 +1,4 @@
 using System;
-using System.Net;
 using System.Text;
 using System.Threading;
 using UnityEngine;
@@ -25,6 +24,33 @@ namespace RemoteExecution
 
         public string Code { get; }
         public string Message { get; }
+    }
+
+    public sealed class RemoteExecutionPlayerOptions
+    {
+        public RemoteExecutionPlayerOptions(IRemoteExecutionConnector connector = null,
+            string clientId = null,
+            int maxCommandRequestBytes =
+                RemoteExecutionProtocol.DefaultMaxCommandRequestBytes,
+            int maxCommandResponseBytes =
+                RemoteExecutionProtocol.DefaultMaxCommandResponseBytes,
+            TimeSpan? connectTimeout = null,
+            TimeSpan? handshakeTimeout = null)
+        {
+            Connector = connector;
+            ClientId = clientId;
+            MaxCommandRequestBytes = maxCommandRequestBytes;
+            MaxCommandResponseBytes = maxCommandResponseBytes;
+            ConnectTimeout = connectTimeout ?? TimeSpan.FromSeconds(10);
+            HandshakeTimeout = handshakeTimeout ?? TimeSpan.FromSeconds(15);
+        }
+
+        public IRemoteExecutionConnector Connector { get; }
+        public string ClientId { get; }
+        public int MaxCommandRequestBytes { get; }
+        public int MaxCommandResponseBytes { get; }
+        public TimeSpan ConnectTimeout { get; }
+        public TimeSpan HandshakeTimeout { get; }
     }
 
     public static class RemoteExecutionPlayerApi
@@ -61,13 +87,20 @@ namespace RemoteExecution
             int maxCommandRequestBytes = RemoteExecutionProtocol.DefaultMaxCommandRequestBytes,
             int maxCommandResponseBytes = RemoteExecutionProtocol.DefaultMaxCommandResponseBytes)
         {
+            Start(new RemoteExecutionPlayerOptions(
+                new RemoteExecutionTcpConnector(editorHost, editorPort), clientId,
+                maxCommandRequestBytes, maxCommandResponseBytes));
+        }
+
+        public static void Start(RemoteExecutionPlayerOptions options)
+        {
             EnsureMainThread();
+            if (options == null) throw new ArgumentNullException(nameof(options));
 #if UNITY_EDITOR
             throw new PlatformNotSupportedException(
                 "The Remote Execution Player client is not available in the Unity Editor.");
 #else
-            RemoteExecutionPlayerConfiguration configuration = CreateConfiguration(editorHost,
-                editorPort, clientId, maxCommandRequestBytes, maxCommandResponseBytes);
+            RemoteExecutionPlayerConfiguration configuration = CreateConfiguration(options);
             RemoteExecutionPlayerDriver driver;
             lock (s_Lock) driver = s_Driver;
             if (driver == null)
@@ -145,37 +178,46 @@ namespace RemoteExecution
             }
         }
 
-        private static RemoteExecutionPlayerConfiguration CreateConfiguration(string editorHost,
-            int editorPort, string clientId, int maxCommandRequestBytes,
-            int maxCommandResponseBytes)
+        private static RemoteExecutionPlayerConfiguration CreateConfiguration(
+            RemoteExecutionPlayerOptions options)
         {
-            string host = (editorHost ?? string.Empty).Trim();
-            if (host.Length == 0)
-                throw new ArgumentException("Editor host is required.", nameof(editorHost));
-            if (host == "*" || IsWildcardAddress(host))
-                throw new ArgumentException("A wildcard address cannot be used as an Editor destination.",
-                    nameof(editorHost));
-            if (editorPort < 1 || editorPort > ushort.MaxValue)
-                throw new ArgumentOutOfRangeException(nameof(editorPort),
-                    "Editor port must be in range 1..65535.");
-            if (maxCommandRequestBytes < 0 ||
-                maxCommandRequestBytes > RemoteExecutionProtocol.MaxCommandRequestBytes)
-                throw new ArgumentOutOfRangeException(nameof(maxCommandRequestBytes));
-            if (maxCommandResponseBytes < 0 ||
-                maxCommandResponseBytes > RemoteExecutionProtocol.MaxCommandResponseBytes)
-                throw new ArgumentOutOfRangeException(nameof(maxCommandResponseBytes));
+            IRemoteExecutionConnector connector = options.Connector ??
+                new RemoteExecutionTcpConnector();
+            string connectionKey = (connector.ConnectionKey ?? string.Empty).Trim();
+            if (connectionKey.Length == 0)
+                throw new ArgumentException("Connector connection key is required.",
+                    nameof(options));
+            if (GetUtf8ByteCount(connectionKey) > RemoteExecutionProtocol.MaxStringBytes)
+                throw new ArgumentException("Connector connection key is too long.",
+                    nameof(options));
+            if (options.MaxCommandRequestBytes < 0 ||
+                options.MaxCommandRequestBytes > RemoteExecutionProtocol.MaxCommandRequestBytes)
+                throw new ArgumentOutOfRangeException(nameof(options.MaxCommandRequestBytes));
+            if (options.MaxCommandResponseBytes < 0 ||
+                options.MaxCommandResponseBytes > RemoteExecutionProtocol.MaxCommandResponseBytes)
+                throw new ArgumentOutOfRangeException(nameof(options.MaxCommandResponseBytes));
+            ValidateTimeout(options.ConnectTimeout, nameof(options.ConnectTimeout));
+            ValidateTimeout(options.HandshakeTimeout, nameof(options.HandshakeTimeout));
 
-            string resolvedClientId = string.IsNullOrWhiteSpace(clientId)
-                ? ResolveClientId() : clientId.Trim();
+            string resolvedClientId = string.IsNullOrWhiteSpace(options.ClientId)
+                ? ResolveClientId() : options.ClientId.Trim();
             if (string.IsNullOrWhiteSpace(resolvedClientId) ||
                 GetUtf8ByteCount(resolvedClientId) > RemoteExecutionProtocol.MaxStringBytes)
                 throw new ArgumentException(
                     $"Client ID must contain 1..{RemoteExecutionProtocol.MaxStringBytes} UTF-8 bytes.",
-                    nameof(clientId));
+                    nameof(options.ClientId));
 
-            return new RemoteExecutionPlayerConfiguration(host, editorPort, resolvedClientId,
-                maxCommandRequestBytes, maxCommandResponseBytes, Application.unityVersion,
-                GetRuntimeTarget());
+            return new RemoteExecutionPlayerConfiguration(connector, connectionKey,
+                resolvedClientId, options.MaxCommandRequestBytes,
+                options.MaxCommandResponseBytes, options.ConnectTimeout,
+                options.HandshakeTimeout, Application.unityVersion, GetRuntimeTarget());
+        }
+
+        private static void ValidateTimeout(TimeSpan timeout, string parameterName)
+        {
+            if (timeout <= TimeSpan.Zero || timeout > TimeSpan.FromHours(1))
+                throw new ArgumentOutOfRangeException(parameterName,
+                    "Timeout must be greater than zero and no more than one hour.");
         }
 
         private static string ResolveClientId()
@@ -189,12 +231,6 @@ namespace RemoteExecution
                     s_FallbackClientId = $"Player-{Guid.NewGuid():N}";
                 return s_FallbackClientId;
             }
-        }
-
-        private static bool IsWildcardAddress(string host)
-        {
-            if (!IPAddress.TryParse(host.Trim('[', ']'), out IPAddress address)) return false;
-            return address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any);
         }
 
         private static int GetUtf8ByteCount(string value)
@@ -244,52 +280,61 @@ namespace RemoteExecution
         }
     }
 
-    internal sealed class RemoteExecutionPlayerConfiguration : IEquatable<RemoteExecutionPlayerConfiguration>
+    internal sealed class RemoteExecutionPlayerConfiguration :
+        IEquatable<RemoteExecutionPlayerConfiguration>
     {
-        internal RemoteExecutionPlayerConfiguration(string editorHost, int editorPort,
-            string clientId, int maxCommandRequestBytes, int maxCommandResponseBytes,
-            string unityVersion, string target)
+        internal RemoteExecutionPlayerConfiguration(IRemoteExecutionConnector connector,
+            string connectionKey, string clientId, int maxCommandRequestBytes,
+            int maxCommandResponseBytes, TimeSpan connectTimeout,
+            TimeSpan handshakeTimeout, string unityVersion, string target)
         {
-            EditorHost = editorHost;
-            EditorPort = editorPort;
+            Connector = connector;
+            ConnectionKey = connectionKey;
             ClientId = clientId;
             MaxCommandRequestBytes = maxCommandRequestBytes;
             MaxCommandResponseBytes = maxCommandResponseBytes;
+            ConnectTimeout = connectTimeout;
+            HandshakeTimeout = handshakeTimeout;
             UnityVersion = unityVersion;
             Target = target;
         }
 
-        internal string EditorHost { get; }
-        internal int EditorPort { get; }
+        internal IRemoteExecutionConnector Connector { get; }
+        internal string ConnectionKey { get; }
         internal string ClientId { get; }
         internal int MaxCommandRequestBytes { get; }
         internal int MaxCommandResponseBytes { get; }
+        internal TimeSpan ConnectTimeout { get; }
+        internal TimeSpan HandshakeTimeout { get; }
         internal string UnityVersion { get; }
         internal string Target { get; }
 
         public bool Equals(RemoteExecutionPlayerConfiguration other)
         {
             return other != null &&
-                string.Equals(EditorHost, other.EditorHost, StringComparison.OrdinalIgnoreCase) &&
-                EditorPort == other.EditorPort &&
+                string.Equals(ConnectionKey, other.ConnectionKey, StringComparison.Ordinal) &&
                 string.Equals(ClientId, other.ClientId, StringComparison.Ordinal) &&
                 MaxCommandRequestBytes == other.MaxCommandRequestBytes &&
                 MaxCommandResponseBytes == other.MaxCommandResponseBytes &&
+                ConnectTimeout == other.ConnectTimeout &&
+                HandshakeTimeout == other.HandshakeTimeout &&
                 string.Equals(UnityVersion, other.UnityVersion, StringComparison.Ordinal) &&
                 string.Equals(Target, other.Target, StringComparison.Ordinal);
         }
 
-        public override bool Equals(object obj) => Equals(obj as RemoteExecutionPlayerConfiguration);
+        public override bool Equals(object obj) =>
+            Equals(obj as RemoteExecutionPlayerConfiguration);
 
         public override int GetHashCode()
         {
             unchecked
             {
-                int hash = StringComparer.OrdinalIgnoreCase.GetHashCode(EditorHost);
-                hash = (hash * 397) ^ EditorPort;
+                int hash = StringComparer.Ordinal.GetHashCode(ConnectionKey);
                 hash = (hash * 397) ^ StringComparer.Ordinal.GetHashCode(ClientId);
                 hash = (hash * 397) ^ MaxCommandRequestBytes;
                 hash = (hash * 397) ^ MaxCommandResponseBytes;
+                hash = (hash * 397) ^ ConnectTimeout.GetHashCode();
+                hash = (hash * 397) ^ HandshakeTimeout.GetHashCode();
                 return hash;
             }
         }

@@ -2,8 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Net;
-using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,14 +13,17 @@ namespace RemoteExecution
     [InitializeOnLoad]
     internal static class RemoteExecutionServer
     {
-        private const int MaxClients = 4;
         private const int CommandResponseGraceSeconds = 5;
         private static readonly object s_Lock = new object();
         private static readonly Dictionary<int, ClientSession> s_Sessions =
             new Dictionary<int, ClientSession>();
-        private static TcpListener s_Listener;
+        private static IRemoteExecutionListener s_Listener;
         private static CancellationTokenSource s_Cancellation;
         private static int s_NextSessionId;
+        private static int s_MaxClients;
+        private static TimeSpan s_HandshakeTimeout;
+        private static string s_ListenerDescription = string.Empty;
+        private static long s_Generation;
 
         static RemoteExecutionServer()
         {
@@ -30,8 +31,15 @@ namespace RemoteExecution
             EditorApplication.quitting += Stop;
         }
 
-        internal static bool IsRunning => s_Listener != null;
-        internal static int Port => (s_Listener?.LocalEndpoint as IPEndPoint)?.Port ?? 0;
+        internal static bool IsRunning
+        {
+            get { lock (s_Lock) return s_Listener != null; }
+        }
+
+        internal static string ListenerDescription
+        {
+            get { lock (s_Lock) return s_ListenerDescription; }
+        }
 
         internal static IReadOnlyList<RemoteExecutionClientInfo> GetClients()
         {
@@ -44,33 +52,51 @@ namespace RemoteExecution
             }
         }
 
-        internal static void Start(string address, int port)
+        internal static void Start(RemoteExecutionServerOptions options)
         {
-            if (!IPAddress.TryParse(address, out IPAddress ip))
-                throw new InvalidOperationException("Invalid bind address.");
-            if (port < 0 || port > ushort.MaxValue)
-                throw new InvalidOperationException("Invalid port.");
+            if (options == null) throw new ArgumentNullException(nameof(options));
             Stop();
-            s_Cancellation = new CancellationTokenSource();
-            s_Listener = new TcpListener(ip, port);
-            s_Listener.Start();
-            AcceptLoopAsync(s_Listener, s_Cancellation.Token).Forget();
-            Debug.Log($"[Unity.RemoteExecution] listening on {s_Listener.LocalEndpoint}");
+            var cancellation = new CancellationTokenSource();
+            long generation;
+            lock (s_Lock)
+            {
+                s_Listener = options.Listener;
+                s_Cancellation = cancellation;
+                s_MaxClients = options.MaxClients;
+                s_HandshakeTimeout = options.HandshakeTimeout;
+                s_ListenerDescription = options.ListenerDescription;
+                generation = ++s_Generation;
+            }
+            AcceptLoopAsync(options.Listener, generation, cancellation.Token).Forget();
+            Debug.Log($"[Unity.RemoteExecution] listening on {options.ListenerDescription}");
         }
 
         internal static void Stop()
         {
-            s_Cancellation?.Cancel();
-            s_Listener?.Stop();
-            s_Listener = null;
+            IRemoteExecutionListener listener;
+            CancellationTokenSource cancellation;
             lock (s_Lock)
             {
-                foreach (ClientSession session in s_Sessions.Values.ToArray())
-                    session.Dispose();
+                listener = s_Listener;
+                cancellation = s_Cancellation;
+                s_Listener = null;
+                s_Cancellation = null;
+                s_ListenerDescription = string.Empty;
+                ++s_Generation;
+            }
+            cancellation?.Cancel();
+            try { listener?.Abort(); }
+            catch (Exception) { }
+            try { listener?.Dispose(); }
+            catch (Exception) { }
+            ClientSession[] sessions;
+            lock (s_Lock)
+            {
+                sessions = s_Sessions.Values.ToArray();
                 s_Sessions.Clear();
             }
-            s_Cancellation?.Dispose();
-            s_Cancellation = null;
+            foreach (ClientSession session in sessions) session.Dispose();
+            cancellation?.Dispose();
         }
 
         internal static Task<RemoteExecutionResult> ExecuteCommandAsync(int sessionId,
@@ -96,36 +122,89 @@ namespace RemoteExecution
             lock (s_Lock) return s_Sessions.TryGetValue(id, out session);
         }
 
-        private static async Task AcceptLoopAsync(TcpListener listener,
-            CancellationToken cancellationToken)
+        private static async Task AcceptLoopAsync(IRemoteExecutionListener listener,
+            long generation, CancellationToken cancellationToken)
         {
             try
             {
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    TcpClient client = await listener.AcceptTcpClientAsync().ConfigureAwait(false);
-                    client.NoDelay = true;
-                    ClientSession session;
+                    IRemoteExecutionChannel channel = await listener.AcceptAsync(
+                        cancellationToken).ConfigureAwait(false);
+                    if (channel == null)
+                        throw new InvalidOperationException(
+                            "The transport listener returned no channel.");
+                    ClientSession session = null;
                     lock (s_Lock)
                     {
-                        if (s_Sessions.Count >= MaxClients)
+                        if (generation == s_Generation && ReferenceEquals(listener, s_Listener) &&
+                            s_Sessions.Count < s_MaxClients)
                         {
-                            client.Close();
-                            continue;
+                            session = new ClientSession(++s_NextSessionId, channel,
+                                s_HandshakeTimeout);
+                            s_Sessions.Add(session.Id, session);
                         }
-                        session = new ClientSession(++s_NextSessionId, client);
-                        s_Sessions.Add(session.Id, session);
+                    }
+                    if (session == null)
+                    {
+                        DisposeChannel(channel);
+                        continue;
                     }
                     session.RunAsync(cancellationToken).Forget();
                 }
             }
-            catch (ObjectDisposedException) { }
-            catch (SocketException) when (cancellationToken.IsCancellationRequested) { }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+            catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested) { }
+            catch (Exception exception)
+            {
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                    Debug.LogWarning($"[Unity.RemoteExecution] listener stopped: {exception.Message}");
+                    StopFailedListener(listener, generation);
+                }
+            }
+        }
+
+        private static void StopFailedListener(IRemoteExecutionListener listener,
+            long generation)
+        {
+            CancellationTokenSource cancellation;
+            ClientSession[] sessions;
+            lock (s_Lock)
+            {
+                if (generation != s_Generation ||
+                    !ReferenceEquals(listener, s_Listener)) return;
+                cancellation = s_Cancellation;
+                s_Listener = null;
+                s_Cancellation = null;
+                s_ListenerDescription = string.Empty;
+                ++s_Generation;
+                sessions = s_Sessions.Values.ToArray();
+                s_Sessions.Clear();
+            }
+            cancellation?.Cancel();
+            try { listener.Abort(); }
+            catch (Exception) { }
+            try { listener.Dispose(); }
+            catch (Exception) { }
+            foreach (ClientSession session in sessions) session.Dispose();
+            cancellation?.Dispose();
+        }
+
+        private static void DisposeChannel(IRemoteExecutionChannel channel)
+        {
+            if (channel == null) return;
+            try { channel.Abort(); }
+            catch (Exception) { }
+            try { channel.Dispose(); }
+            catch (Exception) { }
         }
 
         private sealed class ClientSession : IDisposable
         {
-            private readonly TcpClient m_Client;
+            private readonly IRemoteExecutionChannel m_Channel;
+            private readonly TimeSpan m_HandshakeTimeout;
+            private readonly object m_StateLock = new object();
             private readonly CancellationTokenSource m_Cancellation = new CancellationTokenSource();
             private readonly SemaphoreSlim m_SendLock = new SemaphoreSlim(1, 1);
             private readonly SemaphoreSlim m_OperationLock = new SemaphoreSlim(1, 1);
@@ -142,10 +221,12 @@ namespace RemoteExecution
             private RemoteCommandInfo[] m_Commands = Array.Empty<RemoteCommandInfo>();
             private DateTime m_CommandsUpdatedAt;
 
-            internal ClientSession(int id, TcpClient client)
+            internal ClientSession(int id, IRemoteExecutionChannel channel,
+                TimeSpan handshakeTimeout)
             {
                 Id = id;
-                m_Client = client;
+                m_Channel = channel ?? throw new ArgumentNullException(nameof(channel));
+                m_HandshakeTimeout = handshakeTimeout;
             }
 
             internal int Id { get; }
@@ -154,13 +235,25 @@ namespace RemoteExecution
             {
                 RemoteCommandSnapshot[] commands;
                 DateTime updatedAt;
+                string clientId;
+                string target;
+                string status;
+                bool isReady;
+                lock (m_StateLock)
+                {
+                    clientId = m_ClientId;
+                    target = m_Target;
+                    status = m_Status;
+                    isReady = m_IsReady;
+                }
                 lock (m_CatalogStateLock)
                 {
-                    commands = m_Commands.Select(command => new RemoteCommandSnapshot(command)).ToArray();
+                    commands = m_Commands.Select(command =>
+                        new RemoteCommandSnapshot(command)).ToArray();
                     updatedAt = m_CommandsUpdatedAt;
                 }
-                return new RemoteExecutionClientInfo(Id, m_ClientId, m_Target, m_Status,
-                    m_IsReady, updatedAt, commands);
+                return new RemoteExecutionClientInfo(Id, clientId, target, status,
+                    isReady, updatedAt, commands);
             }
 
             internal async Task RunAsync(CancellationToken serverToken)
@@ -170,31 +263,37 @@ namespace RemoteExecution
                 {
                     try
                     {
-                        NetworkStream stream = m_Client.GetStream();
-                        RemoteFrame hello = await ReadInitialHelloAsync(stream, linked.Token)
+                        RemoteFrame hello = await ReadInitialHelloAsync(linked.Token)
                             .ConfigureAwait(false);
                         if (hello.Kind != RemoteMessageKind.Hello || hello.RequestId == Guid.Empty)
                             throw new InvalidDataException("Hello with a request ID is required.");
                         RemoteHello data = RemoteExecutionProtocol.DecodeHello(hello.Payload);
-                        m_ClientId = data.ClientId;
-                        m_Target = data.Target;
-                        await SendAsync(stream,
-                            new RemoteFrame(RemoteMessageKind.Ready, hello.RequestId,
-                                Array.Empty<byte>()), linked.Token).ConfigureAwait(false);
-                        m_IsReady = true;
-                        m_Status = "Ready";
+                        lock (m_StateLock)
+                        {
+                            m_ClientId = data.ClientId;
+                            m_Target = data.Target;
+                        }
+                        await SendAsync(new RemoteFrame(RemoteMessageKind.Ready,
+                            hello.RequestId, Array.Empty<byte>()), linked.Token)
+                            .ConfigureAwait(false);
+                        lock (m_StateLock)
+                        {
+                            m_IsReady = true;
+                            m_Status = "Ready";
+                        }
                         RequestCommandsInBackground();
                         while (!linked.IsCancellationRequested)
                         {
-                            RemoteFrame frame = await RemoteExecutionProtocol.ReadFrameAsync(stream,
-                                linked.Token).ConfigureAwait(false);
+                            RemoteFrame frame = await m_Channel.ReceiveAsync(linked.Token)
+                                .ConfigureAwait(false);
+                            RemoteExecutionProtocol.ValidateFrame(frame);
                             HandleResponse(frame);
                         }
                     }
                     catch (OperationCanceledException) { }
                     catch (Exception exception)
                     {
-                        m_Status = "Error: " + exception.Message;
+                        lock (m_StateLock) m_Status = "Error: " + exception.Message;
                         FailPending(exception);
                         Debug.LogWarning($"[Unity.RemoteExecution] client {Id} stopped: {exception.Message}");
                     }
@@ -212,8 +311,9 @@ namespace RemoteExecution
                     try
                     {
                         linked.Token.ThrowIfCancellationRequested();
-                        if (!m_IsReady)
-                            throw new InvalidOperationException("Client is not ready.");
+                        lock (m_StateLock)
+                            if (!m_IsReady)
+                                throw new InvalidOperationException("Client is not ready.");
                         await RequestCommandsAsync(linked.Token).ConfigureAwait(false);
                     }
                     finally { m_CatalogLock.Release(); }
@@ -230,8 +330,9 @@ namespace RemoteExecution
                     try
                     {
                         linked.Token.ThrowIfCancellationRequested();
-                        if (!m_IsReady)
-                            throw new InvalidOperationException("Client is not ready.");
+                        lock (m_StateLock)
+                            if (!m_IsReady)
+                                throw new InvalidOperationException("Client is not ready.");
                         RemoteCommandInfo command = FindCommand(commandId);
                         if (command == null)
                             throw new InvalidOperationException($"Remote command was not found: {commandId}");
@@ -250,10 +351,9 @@ namespace RemoteExecution
                         AddPending(requestId, pending);
                         try
                         {
-                            NetworkStream stream = m_Client.GetStream();
                             byte[] hash = ComputeHash(payload);
                             linked.Token.ThrowIfCancellationRequested();
-                            await SendAsync(stream,
+                            await SendAsync(
                                 new RemoteFrame(RemoteMessageKind.CommandInputBegin, requestId,
                                     RemoteExecutionProtocol.EncodeCommandInputBegin(command.Id,
                                         contentType, payload.LongLength, hash)),
@@ -264,14 +364,14 @@ namespace RemoteExecution
                                 linked.Token.ThrowIfCancellationRequested();
                                 int count = Math.Min(RemoteExecutionProtocol.MaxChunkBytes,
                                     payload.Length - offset);
-                                await SendAsync(stream,
+                                await SendAsync(
                                     new RemoteFrame(RemoteMessageKind.CommandInputChunk, requestId,
                                         RemoteExecutionProtocol.EncodeCommandChunk(offset, payload,
                                             offset, count)),
                                     m_Cancellation.Token).ConfigureAwait(false);
                             }
                             linked.Token.ThrowIfCancellationRequested();
-                            await SendAsync(stream,
+                            await SendAsync(
                                 new RemoteFrame(RemoteMessageKind.CommandInputEnd, requestId,
                                     RemoteExecutionProtocol.EncodeCommandEnd()),
                                 m_Cancellation.Token).ConfigureAwait(false);
@@ -325,7 +425,7 @@ namespace RemoteExecution
             private void SendCancelCommand(Guid requestId)
             {
                 if (m_Disposed || m_Cancellation.IsCancellationRequested) return;
-                SendAsync(m_Client.GetStream(),
+                SendAsync(
                     new RemoteFrame(RemoteMessageKind.CancelCommand, requestId, Array.Empty<byte>()),
                     m_Cancellation.Token).Forget();
             }
@@ -338,7 +438,7 @@ namespace RemoteExecution
                 try
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    await SendAsync(m_Client.GetStream(),
+                    await SendAsync(
                         new RemoteFrame(RemoteMessageKind.ListCommands, requestId, Array.Empty<byte>()),
                         m_Cancellation.Token).ConfigureAwait(false);
                     Task timeout = Task.Delay(TimeSpan.FromSeconds(10), CancellationToken.None);
@@ -361,7 +461,8 @@ namespace RemoteExecution
                 RefreshCommandsAsync(m_Cancellation.Token).ContinueWith(task =>
                 {
                     if (task.IsFaulted)
-                        m_Status = "Ready (command catalog unavailable)";
+                        lock (m_StateLock)
+                            m_Status = "Ready (command catalog unavailable)";
                 }, TaskScheduler.Default);
             }
 
@@ -374,7 +475,7 @@ namespace RemoteExecution
                         .ToArray();
                     m_CommandsUpdatedAt = DateTime.UtcNow;
                 }
-                m_Status = "Ready";
+                lock (m_StateLock) m_Status = "Ready";
             }
 
             private RemoteCommandInfo FindCommand(string commandId)
@@ -392,7 +493,7 @@ namespace RemoteExecution
                     throw new InvalidDataException("Unexpected handshake frame.");
                 if (frame.Kind == RemoteMessageKind.Ping)
                 {
-                    SendAsync(m_Client.GetStream(),
+                    SendAsync(
                         new RemoteFrame(RemoteMessageKind.Pong, frame.RequestId, Array.Empty<byte>()),
                         m_Cancellation.Token).Forget();
                     return;
@@ -543,32 +644,49 @@ namespace RemoteExecution
                     string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase);
             }
 
-            private async Task<RemoteFrame> ReadInitialHelloAsync(NetworkStream stream,
+            private async Task<RemoteFrame> ReadInitialHelloAsync(
                 CancellationToken cancellationToken)
             {
-                Task<RemoteFrame> read = RemoteExecutionProtocol.ReadFrameAsync(stream,
-                    cancellationToken);
-                Task timeout = Task.Delay(TimeSpan.FromSeconds(15), CancellationToken.None);
+                Task<RemoteFrame> read;
+                try { read = m_Channel.ReceiveAsync(cancellationToken); }
+                catch
+                {
+                    throw;
+                }
+                if (read == null)
+                    throw new InvalidOperationException(
+                        "The transport channel returned no receive task.");
+                Task timeout = Task.Delay(m_HandshakeTimeout, CancellationToken.None);
                 Task cancelled = Task.Delay(Timeout.Infinite, cancellationToken);
                 Task completed = await Task.WhenAny(read, timeout, cancelled)
                     .ConfigureAwait(false);
-                if (completed == read) return await read.ConfigureAwait(false);
+                if (completed == read)
+                {
+                    RemoteFrame frame = await read.ConfigureAwait(false);
+                    RemoteExecutionProtocol.ValidateFrame(frame);
+                    return frame;
+                }
 
-                m_Client.Close();
+                try { m_Channel.Abort(); }
+                catch (Exception) { }
                 try { await read.ConfigureAwait(false); }
                 catch (Exception) { }
                 cancellationToken.ThrowIfCancellationRequested();
                 throw new TimeoutException("Timed out waiting for the Player Hello.");
             }
 
-            private async Task SendAsync(NetworkStream stream, RemoteFrame frame,
+            private async Task SendAsync(RemoteFrame frame,
                 CancellationToken cancellationToken)
             {
+                RemoteExecutionProtocol.ValidateFrame(frame);
                 await m_SendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
-                    await RemoteExecutionProtocol.WriteFrameAsync(stream, frame,
-                        cancellationToken).ConfigureAwait(false);
+                    Task send = m_Channel.SendAsync(frame, cancellationToken);
+                    if (send == null)
+                        throw new InvalidOperationException(
+                            "The transport channel returned no send task.");
+                    await send.ConfigureAwait(false);
                 }
                 finally { m_SendLock.Release(); }
             }
@@ -595,10 +713,17 @@ namespace RemoteExecution
             {
                 if (m_Disposed) return;
                 m_Disposed = true;
-                m_IsReady = false;
-                if (!m_Status.StartsWith("Error", StringComparison.Ordinal)) m_Status = "Disconnected";
+                lock (m_StateLock)
+                {
+                    m_IsReady = false;
+                    if (!m_Status.StartsWith("Error", StringComparison.Ordinal))
+                        m_Status = "Disconnected";
+                }
                 m_Cancellation.Cancel();
-                m_Client.Close();
+                try { m_Channel.Abort(); }
+                catch (Exception) { }
+                try { m_Channel.Dispose(); }
+                catch (Exception) { }
                 FailPending(new IOException("Remote execution client disconnected."));
             }
 

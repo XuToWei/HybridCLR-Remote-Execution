@@ -83,45 +83,75 @@ namespace RemoteExecution
         private const uint Magic = 0x33585255; // URX3 in little-endian form.
         private static readonly UTF8Encoding s_Utf8 = new UTF8Encoding(false, true);
 
-        public static async Task<RemoteFrame> ReadFrameAsync(Stream stream, CancellationToken cancellationToken)
+        public static async Task<RemoteFrame> ReadFrameAsync(Stream stream,
+            CancellationToken cancellationToken)
         {
             if (stream == null) throw new ArgumentNullException(nameof(stream));
             byte[] header = new byte[HeaderLength];
-            await ReadExactlyAsync(stream, header, 0, header.Length, cancellationToken).ConfigureAwait(false);
-            if (ReadUInt32(header, 0) != Magic) throw new InvalidDataException("Invalid remote execution frame magic.");
-            if (ReadUInt16(header, 4) != Version) throw new InvalidDataException("Unsupported remote execution protocol version.");
-            if (header[7] != 0) throw new InvalidDataException("Unsupported remote execution frame flags.");
-            int payloadLength = checked((int)ReadUInt32(header, 24));
-            if (payloadLength < 0 || payloadLength > MaxFramePayload)
-                throw new InvalidDataException($"Frame payload exceeds {MaxFramePayload} bytes.");
-            byte[] requestId = new byte[16];
-            Buffer.BlockCopy(header, 8, requestId, 0, requestId.Length);
-            RemoteMessageKind kind = (RemoteMessageKind)header[6];
-            if (!Enum.IsDefined(typeof(RemoteMessageKind), kind))
-                throw new InvalidDataException("Unknown remote execution message kind.");
+            await ReadExactlyAsync(stream, header, 0, header.Length, cancellationToken)
+                .ConfigureAwait(false);
+            int payloadLength = ValidateHeader(header);
             byte[] payload = new byte[payloadLength];
-            await ReadExactlyAsync(stream, payload, 0, payload.Length, cancellationToken).ConfigureAwait(false);
-            return new RemoteFrame(kind, new Guid(requestId), payload);
+            await ReadExactlyAsync(stream, payload, 0, payload.Length, cancellationToken)
+                .ConfigureAwait(false);
+            return DecodeFrameParts(header, payload);
         }
 
-        public static async Task WriteFrameAsync(Stream stream, RemoteFrame frame, CancellationToken cancellationToken)
+        public static async Task WriteFrameAsync(Stream stream, RemoteFrame frame,
+            CancellationToken cancellationToken)
         {
             if (stream == null) throw new ArgumentNullException(nameof(stream));
+            ValidateFrame(frame);
+            byte[] header = EncodeFrameHeader(frame);
+            await stream.WriteAsync(header, 0, header.Length, cancellationToken)
+                .ConfigureAwait(false);
+            if (frame.Payload.Length != 0)
+                await stream.WriteAsync(frame.Payload, 0, frame.Payload.Length,
+                    cancellationToken).ConfigureAwait(false);
+            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        public static void ValidateFrame(RemoteFrame frame)
+        {
             if (frame == null) throw new ArgumentNullException(nameof(frame));
             if (!Enum.IsDefined(typeof(RemoteMessageKind), frame.Kind))
                 throw new InvalidDataException("Unknown remote execution message kind.");
+            if (frame.Payload == null)
+                throw new InvalidDataException("Remote execution frame payload is required.");
             if (frame.Payload.Length > MaxFramePayload)
-                throw new InvalidDataException($"Frame payload exceeds {MaxFramePayload} bytes.");
-            byte[] header = new byte[HeaderLength];
-            WriteUInt32(header, 0, Magic);
-            WriteUInt16(header, 4, Version);
-            header[6] = (byte)frame.Kind;
-            Buffer.BlockCopy(frame.RequestId.ToByteArray(), 0, header, 8, 16);
-            WriteUInt32(header, 24, checked((uint)frame.Payload.Length));
-            await stream.WriteAsync(header, 0, header.Length, cancellationToken).ConfigureAwait(false);
+                throw new InvalidDataException(
+                    $"Frame payload exceeds {MaxFramePayload} bytes.");
+        }
+
+        public static byte[] EncodeFrame(RemoteFrame frame)
+        {
+            ValidateFrame(frame);
+            byte[] bytes = new byte[HeaderLength + frame.Payload.Length];
+            byte[] header = EncodeFrameHeader(frame);
+            Buffer.BlockCopy(header, 0, bytes, 0, header.Length);
             if (frame.Payload.Length != 0)
-                await stream.WriteAsync(frame.Payload, 0, frame.Payload.Length, cancellationToken).ConfigureAwait(false);
-            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+                Buffer.BlockCopy(frame.Payload, 0, bytes, HeaderLength,
+                    frame.Payload.Length);
+            return bytes;
+        }
+
+        public static RemoteFrame DecodeFrame(byte[] frameBytes)
+        {
+            if (frameBytes == null) throw new ArgumentNullException(nameof(frameBytes));
+            if (frameBytes.Length < HeaderLength)
+                throw new InvalidDataException("Remote execution frame is truncated.");
+            byte[] header = new byte[HeaderLength];
+            Buffer.BlockCopy(frameBytes, 0, header, 0, HeaderLength);
+            int payloadLength = ValidateHeader(header);
+            if (frameBytes.Length != HeaderLength + payloadLength)
+                throw new InvalidDataException(
+                    frameBytes.Length < HeaderLength + payloadLength
+                        ? "Remote execution frame is truncated."
+                        : "Unexpected trailing remote execution frame bytes.");
+            byte[] payload = new byte[payloadLength];
+            if (payloadLength != 0)
+                Buffer.BlockCopy(frameBytes, HeaderLength, payload, 0, payloadLength);
+            return DecodeFrameParts(header, payload);
         }
 
         public static byte[] EncodeHello(RemoteHello hello)
@@ -389,6 +419,47 @@ namespace RemoteExecution
         {
             DecodeResult(payload, out _, out string code, out string message);
             return new RemoteError { Code = code, Message = message };
+        }
+
+        private static byte[] EncodeFrameHeader(RemoteFrame frame)
+        {
+            byte[] header = new byte[HeaderLength];
+            WriteUInt32(header, 0, Magic);
+            WriteUInt16(header, 4, Version);
+            header[6] = (byte)frame.Kind;
+            Buffer.BlockCopy(frame.RequestId.ToByteArray(), 0, header, 8, 16);
+            WriteUInt32(header, 24, checked((uint)frame.Payload.Length));
+            return header;
+        }
+
+        private static int ValidateHeader(byte[] header)
+        {
+            if (header == null || header.Length != HeaderLength)
+                throw new InvalidDataException("Invalid remote execution frame header.");
+            if (ReadUInt32(header, 0) != Magic)
+                throw new InvalidDataException("Invalid remote execution frame magic.");
+            if (ReadUInt16(header, 4) != Version)
+                throw new InvalidDataException("Unsupported remote execution protocol version.");
+            if (header[7] != 0)
+                throw new InvalidDataException("Unsupported remote execution frame flags.");
+            RemoteMessageKind kind = (RemoteMessageKind)header[6];
+            if (!Enum.IsDefined(typeof(RemoteMessageKind), kind))
+                throw new InvalidDataException("Unknown remote execution message kind.");
+            uint encodedLength = ReadUInt32(header, 24);
+            if (encodedLength > MaxFramePayload)
+                throw new InvalidDataException(
+                    $"Frame payload exceeds {MaxFramePayload} bytes.");
+            return checked((int)encodedLength);
+        }
+
+        private static RemoteFrame DecodeFrameParts(byte[] header, byte[] payload)
+        {
+            byte[] requestId = new byte[16];
+            Buffer.BlockCopy(header, 8, requestId, 0, requestId.Length);
+            var frame = new RemoteFrame((RemoteMessageKind)header[6],
+                new Guid(requestId), payload);
+            ValidateFrame(frame);
+            return frame;
         }
 
         private static void ValidateCommandInfo(RemoteCommandInfo command)

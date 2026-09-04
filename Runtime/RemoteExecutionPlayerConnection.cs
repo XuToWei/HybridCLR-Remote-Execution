@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -9,17 +8,15 @@ namespace RemoteExecution
 {
     internal sealed class RemoteExecutionPlayerConnection
     {
-        private const int ConnectTimeoutSeconds = 10;
-        private const int HandshakeTimeoutSeconds = 15;
         private readonly RemoteExecutionPlayerDriver m_Driver;
         private readonly long m_Generation;
         private readonly RemoteExecutionPlayerConfiguration m_Configuration;
-        private readonly CancellationTokenSource m_Cancellation = new CancellationTokenSource();
+        private readonly CancellationTokenSource m_Cancellation =
+            new CancellationTokenSource();
         private readonly SemaphoreSlim m_SendSignal = new SemaphoreSlim(0);
         private readonly Queue<RemoteFrame> m_SendQueue = new Queue<RemoteFrame>();
         private readonly object m_Lock = new object();
-        private TcpClient m_Client;
-        private NetworkStream m_Stream;
+        private IRemoteExecutionChannel m_Channel;
         private bool m_StopRequested;
         private bool m_Disposed;
         private bool m_Ready;
@@ -44,8 +41,8 @@ namespace RemoteExecution
             {
                 if (m_StopRequested) return;
                 m_StopRequested = true;
-                CloseTransport();
             }
+            CloseTransport();
         }
 
         internal void Send(RemoteMessageKind kind, Guid requestId, byte[] payload)
@@ -66,10 +63,12 @@ namespace RemoteExecution
             RemoteExecutionConnectionError error = null;
             try
             {
-                m_Client = new TcpClient { NoDelay = true };
-                await ConnectWithTimeoutAsync(m_Client, m_Cancellation.Token)
+                m_Channel = await ConnectWithTimeoutAsync(m_Cancellation.Token)
                     .ConfigureAwait(false);
-                m_Stream = m_Client.GetStream();
+                if (m_Channel == null)
+                    throw new RemoteExecutionConnectionException("CONNECT_FAILED",
+                        "The transport connector returned no channel.");
+                if (IsStopRequested()) return;
                 m_Driver.PostHandshaking(m_Generation);
 
                 Guid helloRequestId = Guid.NewGuid();
@@ -80,12 +79,11 @@ namespace RemoteExecution
                     UnityVersion = m_Configuration.UnityVersion,
                     RuntimeVersion = "Unity Remote Execution"
                 };
-                await RemoteExecutionProtocol.WriteFrameAsync(m_Stream,
-                    new RemoteFrame(RemoteMessageKind.Hello, helloRequestId,
-                        RemoteExecutionProtocol.EncodeHello(hello)),
+                await SendFrameAsync(new RemoteFrame(RemoteMessageKind.Hello,
+                    helloRequestId, RemoteExecutionProtocol.EncodeHello(hello)),
                     m_Cancellation.Token).ConfigureAwait(false);
-                RemoteFrame ready = await ReadReadyWithTimeoutAsync(m_Stream,
-                    m_Cancellation.Token).ConfigureAwait(false);
+                RemoteFrame ready = await ReadReadyWithTimeoutAsync(m_Cancellation.Token)
+                    .ConfigureAwait(false);
                 if (ready.Kind != RemoteMessageKind.Ready ||
                     ready.RequestId != helloRequestId || ready.Payload.Length != 0)
                     throw new RemoteExecutionConnectionException("HANDSHAKE_FAILED",
@@ -103,24 +101,28 @@ namespace RemoteExecution
                 Task sendTask = SendLoopAsync(m_Cancellation.Token);
                 Task completed = await Task.WhenAny(receiveTask, sendTask)
                     .ConfigureAwait(false);
-                Exception failure = await GetTaskFailureAsync(completed).ConfigureAwait(false);
-                lock (m_Lock) CloseTransport();
-                Exception receiveFailure = await GetTaskFailureAsync(receiveTask).ConfigureAwait(false);
-                Exception sendFailure = await GetTaskFailureAsync(sendTask).ConfigureAwait(false);
+                Exception failure = await GetTaskFailureAsync(completed)
+                    .ConfigureAwait(false);
+                CloseTransport();
+                Exception receiveFailure = await GetTaskFailureAsync(receiveTask)
+                    .ConfigureAwait(false);
+                Exception sendFailure = await GetTaskFailureAsync(sendTask)
+                    .ConfigureAwait(false);
                 failure = failure ?? receiveFailure ?? sendFailure;
-                if (!IsStopRequested())
-                    error = CreateTerminalError(failure, true);
+                if (!IsStopRequested()) error = CreateTerminalError(failure, true);
             }
             catch (RemoteExecutionConnectionException exception)
             {
                 if (!IsStopRequested())
-                    error = new RemoteExecutionConnectionError(exception.Code, exception.Message);
+                    error = new RemoteExecutionConnectionError(exception.Code,
+                        exception.Message);
             }
             catch (OperationCanceledException)
             {
                 if (!IsStopRequested())
-                    error = new RemoteExecutionConnectionError("CONNECTION_LOST",
-                        "The remote execution connection was cancelled unexpectedly.");
+                    error = new RemoteExecutionConnectionError(
+                        m_WasReady ? "CONNECTION_LOST" : "CONNECT_FAILED",
+                        "The remote execution transport was cancelled unexpectedly.");
             }
             catch (Exception exception)
             {
@@ -129,14 +131,13 @@ namespace RemoteExecution
             }
             finally
             {
+                CloseTransport();
                 lock (m_Lock)
                 {
-                    CloseTransport();
                     m_SendQueue.Clear();
                     m_Disposed = true;
                 }
-                m_Stream = null;
-                m_Client = null;
+                DisposeChannel();
                 m_SendSignal.Dispose();
                 m_Cancellation.Dispose();
             }
@@ -149,9 +150,11 @@ namespace RemoteExecution
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                RemoteFrame frame = await RemoteExecutionProtocol.ReadFrameAsync(m_Stream,
-                    cancellationToken).ConfigureAwait(false);
-                if (frame.Kind == RemoteMessageKind.Hello || frame.Kind == RemoteMessageKind.Ready)
+                RemoteFrame frame = await m_Channel.ReceiveAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                RemoteExecutionProtocol.ValidateFrame(frame);
+                if (frame.Kind == RemoteMessageKind.Hello ||
+                    frame.Kind == RemoteMessageKind.Ready)
                     throw new InvalidDataException("Unexpected handshake frame.");
                 m_Driver.PostFrame(m_Generation, frame);
             }
@@ -170,73 +173,139 @@ namespace RemoteExecution
                         if (m_SendQueue.Count == 0) break;
                         frame = m_SendQueue.Dequeue();
                     }
-                    await RemoteExecutionProtocol.WriteFrameAsync(m_Stream, frame,
-                        cancellationToken).ConfigureAwait(false);
+                    await SendFrameAsync(frame, cancellationToken).ConfigureAwait(false);
                 }
             }
         }
 
-        private async Task ConnectWithTimeoutAsync(TcpClient client,
+        private async Task<IRemoteExecutionChannel> ConnectWithTimeoutAsync(
             CancellationToken cancellationToken)
         {
-            Task connect = client.ConnectAsync(m_Configuration.EditorHost,
-                m_Configuration.EditorPort);
-            Task timeout = Task.Delay(TimeSpan.FromSeconds(ConnectTimeoutSeconds),
-                cancellationToken);
-            if (await Task.WhenAny(connect, timeout).ConfigureAwait(false) != connect)
+            using (var connectCancellation =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
             {
-                client.Close();
-                await IgnoreTaskFailureAsync(connect).ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested();
-                throw new RemoteExecutionConnectionException("CONNECT_TIMEOUT",
-                    $"Timed out connecting to {m_Configuration.EditorHost}:{m_Configuration.EditorPort}.");
-            }
-            try { await connect.ConfigureAwait(false); }
-            catch (Exception exception)
-            {
-                throw new RemoteExecutionConnectionException("CONNECT_FAILED",
-                    exception.Message, exception);
+                Task<IRemoteExecutionChannel> connect;
+                try
+                {
+                    connect = m_Configuration.Connector.ConnectAsync(
+                        connectCancellation.Token);
+                    if (connect == null)
+                        throw new InvalidOperationException(
+                            "The transport connector returned no connect task.");
+                }
+                catch (Exception exception)
+                {
+                    throw new RemoteExecutionConnectionException("CONNECT_FAILED",
+                        exception.Message, exception);
+                }
+                Task timeout = Task.Delay(m_Configuration.ConnectTimeout,
+                    CancellationToken.None);
+                Task cancelled = Task.Delay(Timeout.Infinite, cancellationToken);
+                Task completed = await Task.WhenAny(connect, timeout, cancelled)
+                    .ConfigureAwait(false);
+                if (completed != connect)
+                {
+                    connectCancellation.Cancel();
+                    ObserveLateChannel(connect);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    throw new RemoteExecutionConnectionException("CONNECT_TIMEOUT",
+                        $"Timed out connecting through '{m_Configuration.ConnectionKey}'.");
+                }
+                try { return await connect.ConfigureAwait(false); }
+                catch (OperationCanceledException) when (
+                    cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    throw new RemoteExecutionConnectionException("CONNECT_FAILED",
+                        exception.Message, exception);
+                }
             }
         }
 
-        private async Task<RemoteFrame> ReadReadyWithTimeoutAsync(NetworkStream stream,
+        private async Task<RemoteFrame> ReadReadyWithTimeoutAsync(
             CancellationToken cancellationToken)
         {
-            Task<RemoteFrame> read = RemoteExecutionProtocol.ReadFrameAsync(stream,
-                cancellationToken);
-            Task timeout = Task.Delay(TimeSpan.FromSeconds(HandshakeTimeoutSeconds),
-                cancellationToken);
+            Task<RemoteFrame> read;
+            try { read = m_Channel.ReceiveAsync(cancellationToken); }
+            catch (Exception exception)
+            {
+                throw new RemoteExecutionConnectionException("HANDSHAKE_FAILED",
+                    exception.Message, exception);
+            }
+            if (read == null)
+                throw new RemoteExecutionConnectionException("HANDSHAKE_FAILED",
+                    "The transport channel returned no receive task.");
+            Task timeout = Task.Delay(m_Configuration.HandshakeTimeout,
+                CancellationToken.None);
             if (await Task.WhenAny(read, timeout).ConfigureAwait(false) == read)
             {
-                try { return await read.ConfigureAwait(false); }
-                catch (OperationCanceledException) { throw; }
+                try
+                {
+                    RemoteFrame frame = await read.ConfigureAwait(false);
+                    RemoteExecutionProtocol.ValidateFrame(frame);
+                    return frame;
+                }
+                catch (OperationCanceledException) when (
+                    cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
                 catch (Exception exception)
                 {
                     throw new RemoteExecutionConnectionException("HANDSHAKE_FAILED",
                         exception.Message, exception);
                 }
             }
-            lock (m_Lock) CloseSocket();
+            AbortChannel();
             await IgnoreTaskFailureAsync(read).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             throw new RemoteExecutionConnectionException("HANDSHAKE_TIMEOUT",
                 "Timed out waiting for the Editor Ready response.");
         }
 
+        private Task SendFrameAsync(RemoteFrame frame,
+            CancellationToken cancellationToken)
+        {
+            RemoteExecutionProtocol.ValidateFrame(frame);
+            Task send = m_Channel.SendAsync(frame, cancellationToken);
+            if (send == null)
+                throw new InvalidOperationException(
+                    "The transport channel returned no send task.");
+            return send;
+        }
+
         private void CloseTransport()
         {
             try { m_Cancellation.Cancel(); }
             catch (ObjectDisposedException) { }
-            CloseSocket();
-            m_Ready = false;
+            AbortChannel();
+            lock (m_Lock) m_Ready = false;
         }
 
-        private void CloseSocket()
+        private void AbortChannel()
         {
-            try { m_Stream?.Close(); }
-            catch (ObjectDisposedException) { }
-            try { m_Client?.Close(); }
-            catch (ObjectDisposedException) { }
+            IRemoteExecutionChannel channel;
+            lock (m_Lock) channel = m_Channel;
+            try { channel?.Abort(); }
+            catch (Exception) { }
+        }
+
+        private void DisposeChannel()
+        {
+            IRemoteExecutionChannel channel;
+            lock (m_Lock)
+            {
+                channel = m_Channel;
+                m_Channel = null;
+            }
+            if (channel == null) return;
+            try { channel.Abort(); }
+            catch (Exception) { }
+            try { channel.Dispose(); }
+            catch (Exception) { }
         }
 
         private bool IsStopRequested()
@@ -244,14 +313,16 @@ namespace RemoteExecution
             lock (m_Lock) return m_StopRequested;
         }
 
-        private static RemoteExecutionConnectionError CreateTerminalError(Exception exception,
-            bool wasReady)
+        private static RemoteExecutionConnectionError CreateTerminalError(
+            Exception exception, bool wasReady)
         {
             if (exception is InvalidDataException)
-                return new RemoteExecutionConnectionError("PROTOCOL_ERROR", exception.Message);
+                return new RemoteExecutionConnectionError("PROTOCOL_ERROR",
+                    exception.Message);
             return new RemoteExecutionConnectionError(
                 wasReady ? "CONNECTION_LOST" : "CONNECT_FAILED",
-                exception?.Message ?? "The remote execution connection stopped unexpectedly.");
+                exception?.Message ??
+                "The remote execution connection stopped unexpectedly.");
         }
 
         private static async Task<Exception> GetTaskFailureAsync(Task task)
@@ -269,6 +340,24 @@ namespace RemoteExecution
         {
             try { await task.ConfigureAwait(false); }
             catch (Exception) { }
+        }
+
+        private static void ObserveLateChannel(
+            Task<IRemoteExecutionChannel> connect)
+        {
+            _ = connect.ContinueWith(task =>
+            {
+                if (task.Status != TaskStatus.RanToCompletion)
+                {
+                    _ = task.Exception;
+                    return;
+                }
+                if (task.Result == null) return;
+                try { task.Result.Abort(); }
+                catch (Exception) { }
+                try { task.Result.Dispose(); }
+                catch (Exception) { }
+            }, TaskScheduler.Default);
         }
 
         private sealed class RemoteExecutionConnectionException : Exception

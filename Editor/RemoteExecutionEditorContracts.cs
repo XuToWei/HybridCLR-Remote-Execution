@@ -125,8 +125,73 @@ namespace RemoteExecution
         public IReadOnlyList<RemoteCommandSnapshot> Commands { get; }
     }
 
+    public sealed class RemoteExecutionServerOptions
+    {
+        public RemoteExecutionServerOptions(IRemoteExecutionListener listener,
+            int maxClients = 4, TimeSpan? handshakeTimeout = null)
+        {
+            Listener = listener ?? throw new ArgumentNullException(nameof(listener));
+            ListenerDescription = listener.Description;
+            if (string.IsNullOrWhiteSpace(ListenerDescription))
+                throw new ArgumentException("Listener description is required.",
+                    nameof(listener));
+            if (maxClients < 1 || maxClients > 1024)
+                throw new ArgumentOutOfRangeException(nameof(maxClients));
+            MaxClients = maxClients;
+            HandshakeTimeout = handshakeTimeout ?? TimeSpan.FromSeconds(15);
+            if (HandshakeTimeout <= TimeSpan.Zero ||
+                HandshakeTimeout > TimeSpan.FromHours(1))
+                throw new ArgumentOutOfRangeException(nameof(handshakeTimeout));
+        }
+
+        public IRemoteExecutionListener Listener { get; }
+        internal string ListenerDescription { get; }
+        public int MaxClients { get; }
+        public TimeSpan HandshakeTimeout { get; }
+    }
+
     public static class RemoteExecutionEditorApi
     {
+        public static bool IsServerRunning => RemoteExecutionServer.IsRunning;
+        public static string ListenerDescription =>
+            RemoteExecutionServer.ListenerDescription;
+
+        public static void StartServer(string bindAddress = "127.0.0.1",
+            int port = 38421, int maxClients = 4,
+            TimeSpan? handshakeTimeout = null)
+        {
+            RemoteExecutionTcpListener listener = null;
+            bool started = false;
+            try
+            {
+                listener = new RemoteExecutionTcpListener(bindAddress, port);
+                StartServer(new RemoteExecutionServerOptions(listener, maxClients,
+                    handshakeTimeout));
+                started = true;
+            }
+            finally
+            {
+                if (!started && listener != null)
+                {
+                    try { listener.Abort(); }
+                    catch (Exception) { }
+                    try { listener.Dispose(); }
+                    catch (Exception) { }
+                }
+            }
+        }
+
+        public static void StartServer(RemoteExecutionServerOptions options)
+        {
+            RemoteExecutionServer.Start(options ??
+                throw new ArgumentNullException(nameof(options)));
+        }
+
+        public static void StopServer()
+        {
+            RemoteExecutionServer.Stop();
+        }
+
         public static IReadOnlyList<RemoteExecutionClientInfo> GetClients()
         {
             return RemoteExecutionServer.GetClients();

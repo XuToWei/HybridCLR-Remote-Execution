@@ -2,7 +2,7 @@
 
 English · [简体中文](README.zh-CN.md)
 
-Unity Remote Execution is a TCP bridge between the Unity Editor and a Player, intended for development workflows. Business code registers named commands, the Editor displays each Player's command catalog, and Editor tools can send bounded binary requests and receive bounded binary results.
+Unity Remote Execution is a bridge between the Unity Editor and a Player, intended for development workflows. TCP is bundled, while business code can provide WebSocket or another reliable ordered transport. Business code registers named commands, the Editor displays each Player's command catalog, and Editor tools can send bounded binary requests and receive bounded binary results.
 
 The core package has no HybridCLR dependency. HybridCLR compilation and runtime assembly loading are a conditional adapter implemented with the same generic command API.
 
@@ -58,13 +58,34 @@ public sealed class RemoteExecutionControls : MonoBehaviour
 
 `ConnectionState` reports `Disconnected`, `Connecting`, `Handshaking`, `Connected`, or `Faulted`; `IsConnected` is true only after the Editor acknowledges the protocol handshake. State-change callbacks run on Unity's main thread. `LastError` contains a stable code and message while faulted.
 
-`Start` validates the host, port, client ID, and optional transfer limits synchronously. Calling it again with the same parameters while active does nothing; calling it after a fault retries, and calling it with different parameters replaces the current connection. There is no automatic reconnect, so the business layer controls retry timing and UI. `Stop` is safe to call repeatedly.
+`Start` validates the connector, client ID, timeouts, and optional transfer limits synchronously. The host/port overload and a missing custom connector use the bundled TCP transport. Calling it again with the same parameters while active does nothing; calling it after a fault retries, and calling it with different parameters replaces the current connection. There is no automatic reconnect, so the business layer controls retry timing and UI. `Stop` is safe to call repeatedly.
 
 The Player API is unavailable in Editor Play Mode. Start the Editor listener from **Window > Remote Execution**, then call `RemoteExecutionPlayerApi.Start` from a built Player. No `RemoteExecutionComponent` or settings asset is required.
 
 The package does not restrict which Player build types may connect. The Editor bind address defaults to `127.0.0.1`, and `Start` commonly uses the same host for local connections. For LAN use, bind the Editor to a reachable local interface (or `0.0.0.0`), pass the Editor machine's actual LAN address to the Player, and allow the port through the firewall. `0.0.0.0` is a bind address, not a valid Player destination.
 
-There is no authentication or encryption. Any host that can reach the listener can identify itself arbitrarily and execute exposed commands. Use this bridge only on trusted development networks. The consuming project is responsible for excluding or disabling it in production builds when required.
+The core protocol does not authenticate `ClientId`. Bundled TCP has no authentication or encryption. A custom transport may provide TLS or authentication, but the consuming project still defines its trust policy. Use this bridge only in trusted development environments and control its production-build inclusion and enablement.
+
+## Custom transports
+
+By default, the Player `Start(host, port, ...)` overload and the Editor window use TCP. For WebSocket or another protocol, business code implements `IRemoteExecutionConnector`, `IRemoteExecutionListener`, and the `IRemoteExecutionChannel` returned by both:
+
+```csharp
+// Player: the connector may use WebSocket, IPC, or a project network library.
+var options = new RemoteExecutionPlayerOptions(
+    connector: new GameWebSocketConnector("wss://dev.example/remote"),
+    clientId: "Test Device");
+RemoteExecutionPlayerApi.Start(options);
+
+// Editor: install the matching listener.
+RemoteExecutionEditorApi.StartServer(
+    new RemoteExecutionServerOptions(
+        new GameWebSocketListener("wss://localhost:9443/remote")));
+```
+
+`IRemoteExecutionChannel` carries complete `RemoteFrame` values and must provide reliable, lossless, strictly ordered delivery. The package performs at most one send and one receive concurrently. `Abort()` must promptly unblock pending I/O and, like `Dispose()`, be safely repeatable. A connector's `ConnectionKey` must stably represent all connection-relevant settings—URI, subprotocol, authentication profile, and so on—without containing secrets; equal keys are used for repeated-`Start` detection.
+
+For WebSocket, map one complete URX3 frame to one binary message: use `RemoteExecutionProtocol.EncodeFrame` for sending and `DecodeFrame` after receiving a complete message. Reassemble WebSocket fragments first and reject text messages. An unordered transport such as UDP must provide ordering, retransmission, duplicate suppression, and connection semantics beneath the channel contract.
 
 ## Runtime extension API
 
@@ -235,7 +256,7 @@ Without HybridCLR, the adapter command and HybridCLR panel are absent. The Comma
 - One command executes at a time per Player.
 - `requiresMainThread: true` starts the handler on Unity's main thread; code after an asynchronous continuation is the handler's responsibility.
 - Timeouts and cancellation are cooperative; a handler that ignores cancellation cannot be safely interrupted.
-- The transport has no authentication or encryption; any host that can reach the listener may invoke exposed commands.
+- The core protocol does not authenticate `ClientId`; bundled TCP is unauthenticated and unencrypted, while a custom transport owns any TLS/authentication policy.
 - SHA-256 checks detect accidental transfer corruption, but do not authenticate the peer or protect against active tampering.
 - Do not expose destructive or production-data handlers.
 
